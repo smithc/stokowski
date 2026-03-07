@@ -18,6 +18,51 @@ A Python implementation of the [OpenAI Symphony](https://github.com/openai/symph
 
 ---
 
+## What it actually does
+
+You write a ticket in Linear. You move it to **Todo**. That's it — Stokowski handles everything else:
+
+```
+You move ticket to Todo
+        │
+        ▼
+Stokowski picks it up, clones your repo into an isolated workspace
+        │
+        ▼
+Claude Code reads your codebase, CLAUDE.md, and ticket description
+        │
+        ▼
+Agent implements the feature — writes code, runs tests, fixes type errors
+        │
+        ▼
+Agent opens a Pull Request on GitHub with a full description
+        │
+        ▼
+Agent moves the ticket to Human Review and posts a workpad comment on the issue
+        │
+        ▼
+You review the PR — approve it or request changes
+        │
+   ┌────┴─────┐
+approved    changes requested
+   │              │
+   ▼              ▼
+You move       You move ticket to Rework
+to Merging          │
+   │           Agent picks it up, addresses feedback, updates PR
+   │                │
+   ▼                ▼
+Agent merges   Back to Human Review
+the PR
+   │
+   ▼
+Done ✓
+```
+
+Each agent runs in its own isolated git clone — multiple tickets can be worked in parallel without conflicts. Token usage, turn count, and last activity are tracked live in the terminal and web dashboard.
+
+---
+
 ## What is it?
 
 [Symphony](https://github.com/openai/symphony) is OpenAI's open specification for autonomous coding agent orchestration: poll a tracker for issues, create isolated workspaces, run agents, manage multi-turn sessions, retry failures, and reconcile state. It ships with a Codex/Elixir reference implementation.
@@ -451,6 +496,55 @@ Example `.mcp.json` with Figma, Linear, Playwright, and iOS Simulator:
 ```
 
 Playwright and iOS Simulator don't need MCP — agents can run `npx playwright test` and `xcrun simctl` directly via shell. MCP makes it more ergonomic.
+
+---
+
+## Writing good tickets for agents
+
+The quality of an agent's output is directly proportional to the quality of the ticket it receives. A vague ticket produces vague work. A well-specified ticket with clear acceptance criteria produces work you can ship.
+
+**A good ticket includes:**
+
+- **Summary** — what is being built and why, in plain language
+- **Scope** — what's in and explicitly what's out
+- **Implementation notes** — key files, patterns to follow, technical constraints
+- **Acceptance criteria** — a machine-readable JSON block the agent uses to self-verify before marking the ticket ready for review
+
+### Acceptance criteria JSON
+
+Agents are instructed to read the `criteria` block from the ticket description and verify each item before moving to Human Review. Use this format:
+
+```json
+{
+  "criteria": [
+    { "description": "The settings screen renders correctly on iOS and Android", "verified": false },
+    { "description": "Tapping Save writes changes to the user profile API", "verified": false },
+    { "description": "All existing tests pass", "verified": false },
+    { "description": "No TypeScript errors", "verified": false }
+  ]
+}
+```
+
+Each criterion should be independently verifiable — one thing, not compound statements. Be specific: "renders correctly at 375px viewport" beats "looks good on mobile".
+
+### Using Claude Code to write your tickets
+
+The best way to write a well-structured ticket is to let Claude Code help you. The `examples/create-ticket.md` file in this repo is a Claude Code slash command that walks you through the process interactively — asking the right questions, researching the codebase, and generating a complete description with acceptance criteria.
+
+**To use it, copy it into your project:**
+
+```bash
+mkdir -p .claude/commands
+cp /path/to/stokowski/examples/create-ticket.md .claude/commands/create-ticket.md
+```
+
+Then in Claude Code, run:
+
+```
+/create-ticket
+```
+
+Claude will ask for your Linear ticket identifier, interview you about what needs to be built, research relevant code, draft the acceptance criteria with you, and post the finished description directly to Linear via MCP — ready for an agent to pick up.
 
 ---
 
