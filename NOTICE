@@ -1,0 +1,18 @@
+Stokowski
+Copyright 2026 Sugar-Coffee
+
+This project is a derivative work based on the Symphony specification and
+reference implementation by OpenAI (https://github.com/openai/symphony),
+which is licensed under the Apache License, Version 2.0.
+
+The orchestration architecture, workflow specification, and state machine
+design are adapted from Symphony. The implementation is an original Python
+rewrite targeting Claude Code (Anthropic) as the agent runtime and Linear
+as the issue tracker.
+
+---
+
+This product includes software developed by OpenAI.
+Symphony — https://github.com/openai/symphony
+Copyright OpenAI
+Licensed under the Apache License, Version 2.0
