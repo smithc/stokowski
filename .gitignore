@@ -8,3 +8,4 @@ log/
 *.log
 .env
 WORKFLOW.md
+docs/plans/
