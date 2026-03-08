@@ -67,7 +67,7 @@ Agent implements the feature — writes code, runs tests, fixes type errors
 Agent opens a Pull Request on GitHub with a full description
         │
         ▼
-Agent moves the ticket to Human Review and posts a workpad comment on the issue
+Agent moves the ticket to Human Review, posts a planning + completion comment on the issue
         │
         ▼
 You review the PR — approve it or request changes
@@ -76,9 +76,10 @@ You review the PR — approve it or request changes
 approved    changes requested
    │              │
    ▼              ▼
-You move       You move ticket to Rework
+You move       You (or a bot) move ticket to Rework
 to Merging          │
-   │           Agent picks it up, addresses feedback, updates PR
+   │           Agent reads all new PR comments (CI, bots, reviewers)
+   │           since its last run, addresses feedback, updates PR
    │                │
    ▼                ▼
 Agent merges   Back to Human Review
@@ -329,7 +330,7 @@ Stokowski uses a specific set of states to manage the agent ↔ human handoff. L
 | `Todo` | Human | Ready for an agent to pick up |
 | `In Progress` | Agent | Actively working |
 | `Human Review` | Agent | PR opened, waiting for approval |
-| `Rework` | Human | Changes requested — agent picks up again |
+| `Rework` | Human or bot | Changes requested — agent reads new PR comments and picks up again |
 | `Merging` | Human | PR approved — agent will merge |
 | `Done` | Auto | Complete (via GitHub integration) |
 | `Cancelled` | Human | Abandoned |
@@ -506,7 +507,8 @@ agent:
 Your Jinja2 prompt template goes here.
 Available: {{ issue.identifier }}, {{ issue.title }}, {{ issue.description }},
            {{ issue.state }}, {{ issue.labels }}, {{ issue.url }},
-           {{ issue.priority }}, {{ issue.branch_name }}, {{ attempt }}
+           {{ issue.priority }}, {{ issue.branch_name }}, {{ attempt }},
+           {{ last_run_at }}
 ```
 
 </details>
@@ -529,6 +531,7 @@ The body of `WORKFLOW.md` is a [Jinja2](https://jinja.palletsprojects.com/) temp
 | `{{ issue.branch_name }}` | Suggested git branch name |
 | `{{ issue.blocked_by }}` | List of `{id, identifier, state}` blockers |
 | `{{ attempt }}` | Retry attempt number (`None` on first run) |
+| `{{ last_run_at }}` | ISO 8601 timestamp of the last completed agent run for this issue (empty string on first run) — use to filter PR comments to only those added since the last run |
 
 ---
 
