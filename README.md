@@ -681,15 +681,18 @@ WORKFLOW.md
 
 ## Upgrading
 
-Your personal config lives in `WORKFLOW.md` and `.env` — both gitignored, so pulling the latest Stokowski changes will never touch them.
+Your personal config lives in `WORKFLOW.md` and `.env` — both gitignored, so upgrading will never touch them.
+
+**If you installed by cloning the repo:**
 
 ```bash
 cd stokowski
 
-# Pull latest changes
-git pull origin main
+# Upgrade to the latest stable release
+git fetch --tags
+git checkout $(git describe --tags `git rev-list --tags --max-count=1`)
 
-# Re-install the package (picks up any new dependencies)
+# Re-install to pick up any new dependencies
 source .venv/bin/activate
 pip install -e ".[web]"
 
@@ -697,9 +700,15 @@ pip install -e ".[web]"
 stokowski --dry-run
 ```
 
-That's it. Your `WORKFLOW.md`, `.env`, and any workspace directories are untouched.
+> **Note:** `git pull origin main` will work but may include unreleased commits ahead of the latest tag — treat that as nightly if you go that route.
 
-**After upgrading, check if `WORKFLOW.example.md` has changed** — new config fields or options may have been added that you'll want to adopt:
+**If you installed via pip** *(PyPI coming soon):*
+
+```bash
+pip install --upgrade git+https://github.com/Sugar-Coffee/stokowski.git#egg=stokowski[web]
+```
+
+**After upgrading, check if `WORKFLOW.example.md` has changed** — new config fields may have been added that you'll want to adopt:
 
 ```bash
 git diff HEAD@{1} WORKFLOW.example.md
