@@ -157,6 +157,88 @@ def _coerce_list(val: Any) -> list[str]:
     return []
 
 
+def parse_stage_file(path: Path) -> StageConfig:
+    """Parse a stage .md file into StageConfig."""
+    content = path.read_text()
+    config_raw: dict[str, Any] = {}
+    prompt_body = content
+
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            config_raw = yaml.safe_load(parts[1]) or {}
+            prompt_body = parts[2]
+
+    if not isinstance(config_raw, dict):
+        config_raw = {}
+
+    h = config_raw.get("hooks", {}) or {}
+    hooks = None
+    if h:
+        hooks = HooksConfig(
+            after_create=h.get("after_create"),
+            before_run=h.get("before_run"),
+            after_run=h.get("after_run"),
+            before_remove=h.get("before_remove"),
+            timeout_ms=_coerce_int(h.get("timeout_ms"), 60_000),
+        )
+
+    allowed = config_raw.get("allowed_tools")
+
+    return StageConfig(
+        name=path.stem,
+        runner=str(config_raw.get("runner", "claude")),
+        model=config_raw.get("model"),
+        max_turns=config_raw.get("max_turns"),
+        turn_timeout_ms=config_raw.get("turn_timeout_ms"),
+        stall_timeout_ms=config_raw.get("stall_timeout_ms"),
+        session=str(config_raw.get("session", "inherit")),
+        permission_mode=config_raw.get("permission_mode"),
+        allowed_tools=_coerce_list(allowed) if allowed is not None else None,
+        append_system_prompt=config_raw.get("append_system_prompt"),
+        hooks=hooks,
+        prompt_template=prompt_body.strip(),
+    )
+
+
+def load_stage_configs(
+    workflow_path: Path, pipeline: PipelineConfig
+) -> dict[str, StageConfig]:
+    """Load all stage files referenced by the pipeline. Returns {stage_name: StageConfig}."""
+    stages_dir = workflow_path.parent / "stages"
+    configs: dict[str, StageConfig] = {}
+
+    for stage_name in pipeline.stages:
+        if stage_name.startswith("gate:"):
+            continue
+        stage_file = stages_dir / f"{stage_name}.md"
+        if not stage_file.exists():
+            raise FileNotFoundError(
+                f"Stage file not found: {stage_file} (referenced in pipeline)"
+            )
+        configs[stage_name] = parse_stage_file(stage_file)
+
+    return configs
+
+
+def merge_stage_config(
+    stage: StageConfig, root_claude: ClaudeConfig, root_hooks: HooksConfig
+) -> tuple[ClaudeConfig, HooksConfig]:
+    """Merge stage overrides with root defaults. Returns (claude_cfg, hooks_cfg)."""
+    claude = ClaudeConfig(
+        command=root_claude.command,
+        permission_mode=stage.permission_mode or root_claude.permission_mode,
+        allowed_tools=stage.allowed_tools if stage.allowed_tools is not None else root_claude.allowed_tools,
+        model=stage.model or root_claude.model,
+        max_turns=stage.max_turns if stage.max_turns is not None else root_claude.max_turns,
+        turn_timeout_ms=stage.turn_timeout_ms if stage.turn_timeout_ms is not None else root_claude.turn_timeout_ms,
+        stall_timeout_ms=stage.stall_timeout_ms if stage.stall_timeout_ms is not None else root_claude.stall_timeout_ms,
+        append_system_prompt=stage.append_system_prompt or root_claude.append_system_prompt,
+    )
+    hooks = stage.hooks if stage.hooks is not None else root_hooks
+    return claude, hooks
+
+
 def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
     """Parse a WORKFLOW.md file into config + prompt template."""
     path = Path(path)
@@ -188,6 +270,9 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         active_states=_coerce_list(t.get("active_states")) or ["Todo", "In Progress"],
         terminal_states=_coerce_list(t.get("terminal_states"))
         or ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+        gate_states=_coerce_list(t.get("gate_states")) or ["Awaiting Gate"],
+        gate_approved_state=str(t.get("gate_approved_state", "Gate Approved")),
+        rework_state=str(t.get("rework_state", "Rework")),
     )
 
     # Parse polling
@@ -234,6 +319,23 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
     s = config_raw.get("server", {}) or {}
     server = ServerConfig(port=s.get("port"))
 
+    # Parse pipeline (optional - enables staged workflows)
+    pipeline = None
+    pl = config_raw.get("pipeline", {}) or {}
+    if pl and pl.get("stages"):
+        gates_raw = pl.get("gates", {}) or {}
+        gates = {}
+        for gate_name, gate_data in gates_raw.items():
+            gd = gate_data or {}
+            gates[gate_name] = GateConfig(
+                rework_to=str(gd.get("rework_to", "")),
+                prompt=str(gd.get("prompt", "")),
+            )
+        pipeline = PipelineConfig(
+            stages=_coerce_list(pl.get("stages")),
+            gates=gates,
+        )
+
     cfg = ServiceConfig(
         tracker=tracker,
         polling=polling,
@@ -242,6 +344,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         claude=claude,
         agent=agent,
         server=server,
+        pipeline=pipeline,
     )
 
     return WorkflowDefinition(config=cfg, prompt_template=prompt_template)
