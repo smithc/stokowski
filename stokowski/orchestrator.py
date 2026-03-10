@@ -13,10 +13,27 @@ from typing import Any
 
 from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
 
-from .config import ServiceConfig, WorkflowDefinition, parse_workflow_file, validate_config
+from .config import (
+    ClaudeConfig,
+    HooksConfig,
+    PipelineConfig,
+    ServiceConfig,
+    StageConfig,
+    WorkflowDefinition,
+    load_stage_configs,
+    merge_stage_config,
+    parse_workflow_file,
+    validate_config,
+)
 from .linear import LinearClient
 from .models import Issue, RetryEntry, RunAttempt
-from .runner import run_agent_turn
+from .runner import run_agent_turn, run_turn
+from .tracking import (
+    make_gate_comment,
+    make_stage_comment,
+    parse_latest_tracking,
+    resolve_stage_index,
+)
 from .workspace import ensure_workspace, remove_workspace
 
 logger = logging.getLogger("stokowski")
@@ -50,6 +67,12 @@ class Orchestrator:
         self._last_issues: dict[str, Issue] = {}
         self._last_completed_at: dict[str, datetime] = {}  # issue_id -> last worker completion time
 
+        # Pipeline stage tracking
+        self._stage_configs: dict[str, StageConfig] = {}
+        self._issue_stages: dict[str, int] = {}
+        self._issue_pipeline_runs: dict[str, int] = {}
+        self._pending_gates: dict[str, str] = {}
+
     @property
     def cfg(self) -> ServiceConfig:
         assert self.workflow is not None
@@ -62,6 +85,19 @@ class Orchestrator:
         except Exception as e:
             return [f"Workflow load error: {e}"]
         return validate_config(self.cfg)
+
+    def _load_stage_configs(self) -> list[str]:
+        """Load stage configs if pipeline is defined. Returns errors."""
+        if not self.cfg.pipeline:
+            self._stage_configs = {}
+            return []
+        try:
+            self._stage_configs = load_stage_configs(
+                self.workflow_path, self.cfg.pipeline
+            )
+            return []
+        except Exception as e:
+            return [f"Stage config load error: {e}"]
 
     def _ensure_linear_client(self) -> LinearClient:
         if self._linear is None:
@@ -153,13 +189,243 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Startup cleanup failed (continuing): {e}")
 
+    async def _resolve_current_stage(self, issue: Issue) -> tuple[int, str]:
+        """Resolve current pipeline stage for an issue.
+        Returns (stage_index, stage_name).
+        """
+        pipeline = self.cfg.pipeline
+        assert pipeline is not None
+
+        if issue.id in self._issue_stages:
+            idx = self._issue_stages[issue.id]
+            if idx < len(pipeline.stages):
+                return idx, pipeline.stages[idx]
+
+        client = self._ensure_linear_client()
+        comments = await client.fetch_comments(issue.id)
+        tracking = parse_latest_tracking(comments)
+
+        if tracking is None:
+            self._issue_stages[issue.id] = 0
+            self._issue_pipeline_runs[issue.id] = 1
+            return 0, pipeline.stages[0]
+
+        if tracking["type"] == "stage":
+            idx = tracking.get("index", 0)
+            pipeline_run = tracking.get("pipeline_run", 1)
+            if idx < len(pipeline.stages):
+                self._issue_stages[issue.id] = idx
+                self._issue_pipeline_runs[issue.id] = pipeline_run
+                return idx, pipeline.stages[idx]
+            self._issue_stages[issue.id] = 0
+            self._issue_pipeline_runs[issue.id] = pipeline_run + 1
+            return 0, pipeline.stages[0]
+
+        if tracking["type"] == "gate":
+            gate_name = tracking.get("gate", "")
+            status = tracking.get("status", "")
+            pipeline_run = tracking.get("pipeline_run", 1)
+
+            if status == "waiting":
+                idx = resolve_stage_index(pipeline.stages, gate_name)
+                if idx is not None:
+                    self._issue_stages[issue.id] = idx
+                    self._pending_gates[issue.id] = gate_name
+                    return idx, f"gate:{gate_name}"
+            elif status == "approved":
+                idx = resolve_stage_index(pipeline.stages, gate_name)
+                if idx is not None and idx + 1 < len(pipeline.stages):
+                    next_idx = idx + 1
+                    self._issue_stages[issue.id] = next_idx
+                    self._issue_pipeline_runs[issue.id] = pipeline_run
+                    return next_idx, pipeline.stages[next_idx]
+            elif status == "rework":
+                rework_to = tracking.get("rework_to", "")
+                for i, s in enumerate(pipeline.stages):
+                    if s == rework_to:
+                        self._issue_stages[issue.id] = i
+                        self._issue_pipeline_runs[issue.id] = pipeline_run
+                        return i, pipeline.stages[i]
+
+        self._issue_stages[issue.id] = 0
+        self._issue_pipeline_runs[issue.id] = 1
+        return 0, pipeline.stages[0]
+
+    async def _enter_gate(self, issue: Issue, gate_name: str):
+        """Move issue to gate state and post tracking comment."""
+        pipeline = self.cfg.pipeline
+        assert pipeline is not None
+
+        gate_cfg = pipeline.gates.get(gate_name)
+        prompt = gate_cfg.prompt if gate_cfg else ""
+        pipeline_run = self._issue_pipeline_runs.get(issue.id, 1)
+
+        client = self._ensure_linear_client()
+
+        comment = make_gate_comment(
+            gate_name=gate_name,
+            status="waiting",
+            prompt=prompt,
+            pipeline_run=pipeline_run,
+        )
+        await client.post_comment(issue.id, comment)
+
+        gate_state = self.cfg.tracker.gate_states[0] if self.cfg.tracker.gate_states else "Awaiting Gate"
+        await client.update_issue_state(issue.id, gate_state)
+
+        self._pending_gates[issue.id] = gate_name
+        # Release from running/claimed so it doesn't block slots
+        self.running.pop(issue.id, None)
+        self._tasks.pop(issue.id, None)
+
+        logger.info(
+            f"Gate entered issue={issue.identifier} gate={gate_name} "
+            f"pipeline_run={pipeline_run}"
+        )
+
+    async def _advance_stage(self, issue: Issue):
+        """Advance to the next pipeline stage after a successful stage completion."""
+        pipeline = self.cfg.pipeline
+        assert pipeline is not None
+
+        current_idx = self._issue_stages.get(issue.id, 0)
+        next_idx = current_idx + 1
+        pipeline_run = self._issue_pipeline_runs.get(issue.id, 1)
+
+        if next_idx >= len(pipeline.stages):
+            logger.info(f"Pipeline complete issue={issue.identifier}")
+            self._issue_stages.pop(issue.id, None)
+            self._issue_pipeline_runs.pop(issue.id, None)
+            self._pending_gates.pop(issue.id, None)
+            self.claimed.discard(issue.id)
+            return
+
+        next_stage = pipeline.stages[next_idx]
+        self._issue_stages[issue.id] = next_idx
+
+        if next_stage.startswith("gate:"):
+            gate_name = next_stage[5:]
+            await self._enter_gate(issue, gate_name)
+        else:
+            client = self._ensure_linear_client()
+            comment = make_stage_comment(
+                stage=next_stage,
+                index=next_idx,
+                total=len(pipeline.stages),
+                pipeline_run=pipeline_run,
+            )
+            await client.post_comment(issue.id, comment)
+            self._schedule_retry(issue, attempt_num=0, delay_ms=1000)
+
+    async def _handle_gate_responses(self):
+        """Check for gate-approved and rework issues, handle transitions."""
+        pipeline = self.cfg.pipeline
+        if not pipeline:
+            return
+
+        client = self._ensure_linear_client()
+
+        # Fetch gate-approved issues
+        try:
+            approved_issues = await client.fetch_issues_by_states(
+                self.cfg.tracker.project_slug,
+                [self.cfg.tracker.gate_approved_state],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch gate-approved issues: {e}")
+            approved_issues = []
+
+        for issue in approved_issues:
+            if issue.id in self.running or issue.id in self.claimed:
+                continue
+
+            gate_name = self._pending_gates.pop(issue.id, None)
+            if not gate_name:
+                comments = await client.fetch_comments(issue.id)
+                tracking = parse_latest_tracking(comments)
+                if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
+                    gate_name = tracking.get("gate", "")
+
+            if gate_name:
+                pipeline_run = self._issue_pipeline_runs.get(issue.id, 1)
+                comment = make_gate_comment(
+                    gate_name=gate_name, status="approved", pipeline_run=pipeline_run,
+                )
+                await client.post_comment(issue.id, comment)
+
+                gate_idx = resolve_stage_index(pipeline.stages, gate_name)
+                if gate_idx is not None and gate_idx + 1 < len(pipeline.stages):
+                    self._issue_stages[issue.id] = gate_idx + 1
+
+                active_state = self.cfg.tracker.active_states[0] if self.cfg.tracker.active_states else "In Progress"
+                await client.update_issue_state(issue.id, active_state)
+                issue.state = active_state
+                self._last_issues[issue.id] = issue
+                logger.info(f"Gate approved issue={issue.identifier} gate={gate_name}")
+
+        # Fetch rework issues
+        try:
+            rework_issues = await client.fetch_issues_by_states(
+                self.cfg.tracker.project_slug,
+                [self.cfg.tracker.rework_state],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch rework issues: {e}")
+            rework_issues = []
+
+        for issue in rework_issues:
+            if issue.id in self.running or issue.id in self.claimed:
+                continue
+
+            gate_name = self._pending_gates.pop(issue.id, None)
+            if not gate_name:
+                comments = await client.fetch_comments(issue.id)
+                tracking = parse_latest_tracking(comments)
+                if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
+                    gate_name = tracking.get("gate", "")
+
+            if gate_name:
+                gate_cfg = pipeline.gates.get(gate_name)
+                rework_to = gate_cfg.rework_to if gate_cfg else ""
+                if not rework_to:
+                    logger.warning(f"Gate {gate_name} has no rework_to target, skipping")
+                    continue
+
+                pipeline_run = self._issue_pipeline_runs.get(issue.id, 1) + 1
+                self._issue_pipeline_runs[issue.id] = pipeline_run
+
+                comment = make_gate_comment(
+                    gate_name=gate_name, status="rework",
+                    rework_to=rework_to, pipeline_run=pipeline_run,
+                )
+                await client.post_comment(issue.id, comment)
+
+                for i, s in enumerate(pipeline.stages):
+                    if s == rework_to:
+                        self._issue_stages[issue.id] = i
+                        break
+
+                active_state = self.cfg.tracker.active_states[0] if self.cfg.tracker.active_states else "In Progress"
+                await client.update_issue_state(issue.id, active_state)
+                issue.state = active_state
+                self._last_issues[issue.id] = issue
+                logger.info(f"Rework issue={issue.identifier} gate={gate_name} rework_to={rework_to} pipeline_run={pipeline_run}")
+
     async def _tick(self):
         """Single poll tick: reconcile, validate, fetch, dispatch."""
         # Reload workflow (supports hot-reload)
         errors = self._load_workflow()
 
+        # Reload stage configs if pipeline is defined
+        if self.cfg.pipeline:
+            errors.extend(self._load_stage_configs())
+
         # Part 1: Reconcile running issues
         await self._reconcile()
+
+        # Handle gate responses (pipeline mode)
+        if self.cfg.pipeline:
+            await self._handle_gate_responses()
 
         # Part 2: Validate config
         if errors:
@@ -246,19 +512,42 @@ class Orchestrator:
     def _dispatch(self, issue: Issue, attempt_num: int | None = None):
         """Dispatch a worker for an issue."""
         self.claimed.add(issue.id)
+
+        stage_name = None
+        runner_type = "claude"
+        if self.cfg.pipeline:
+            idx = self._issue_stages.get(issue.id, 0)
+            if idx < len(self.cfg.pipeline.stages):
+                stage_name = self.cfg.pipeline.stages[idx]
+            if stage_name and stage_name.startswith("gate:"):
+                asyncio.create_task(self._enter_gate(issue, stage_name[5:]))
+                return
+            stage_cfg = self._stage_configs.get(stage_name) if stage_name else None
+            if stage_cfg:
+                runner_type = stage_cfg.runner
+
         attempt = RunAttempt(
             issue_id=issue.id,
             issue_identifier=issue.identifier,
             attempt=attempt_num,
+            stage=stage_name,
+            runner_type=runner_type,
         )
 
-        # Check for existing or previously known session to resume
-        if issue.id in self.running:
-            old = self.running[issue.id]
-            if old.session_id:
-                attempt.session_id = old.session_id
-        elif issue.id in self._last_session_ids:
-            attempt.session_id = self._last_session_ids[issue.id]
+        # Session handling
+        use_fresh_session = False
+        if self.cfg.pipeline and stage_name:
+            stage_cfg = self._stage_configs.get(stage_name)
+            if stage_cfg and stage_cfg.session == "fresh":
+                use_fresh_session = True
+
+        if not use_fresh_session:
+            if issue.id in self.running:
+                old = self.running[issue.id]
+                if old.session_id:
+                    attempt.session_id = old.session_id
+            elif issue.id in self._last_session_ids:
+                attempt.session_id = self._last_session_ids[issue.id]
 
         self.running[issue.id] = attempt
         task = asyncio.create_task(self._run_worker(issue, attempt))
@@ -267,26 +556,51 @@ class Orchestrator:
         logger.info(
             f"Dispatched issue={issue.identifier} "
             f"state={issue.state} "
+            f"stage={stage_name or 'legacy'} "
+            f"runner={runner_type} "
+            f"session={'fresh' if use_fresh_session else 'inherit'} "
             f"attempt={attempt_num}"
         )
 
     async def _run_worker(self, issue: Issue, attempt: RunAttempt):
         """Worker coroutine: prepare workspace, run agent turns."""
         try:
-            # Prepare workspace
+            claude_cfg = self.cfg.claude
+            hooks_cfg = self.cfg.hooks
+            runner_type = attempt.runner_type
+
+            if self.cfg.pipeline and attempt.stage:
+                stage_cfg = self._stage_configs.get(attempt.stage)
+                if stage_cfg:
+                    claude_cfg, hooks_cfg = merge_stage_config(
+                        stage_cfg, self.cfg.claude, self.cfg.hooks
+                    )
+                    runner_type = stage_cfg.runner
+
             ws_root = self.cfg.workspace.resolved_root()
             ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
             attempt.workspace_path = str(ws.path)
 
-            # Render prompt
-            prompt = self._render_prompt(issue, attempt.attempt)
+            # Post stage tracking comment
+            if self.cfg.pipeline and attempt.stage:
+                pipeline = self.cfg.pipeline
+                idx = self._issue_stages.get(issue.id, 0)
+                pipeline_run = self._issue_pipeline_runs.get(issue.id, 1)
+                client = self._ensure_linear_client()
+                comment = make_stage_comment(
+                    stage=attempt.stage,
+                    index=idx,
+                    total=len(pipeline.stages),
+                    pipeline_run=pipeline_run,
+                )
+                await client.post_comment(issue.id, comment)
 
-            # Run turns
-            max_turns = self.cfg.claude.max_turns
+            prompt = self._render_prompt(issue, attempt.attempt, attempt.stage)
+
+            max_turns = claude_cfg.max_turns
             for turn in range(max_turns):
                 if turn > 0:
-                    # Continuation: check if issue is still active
-                    current_state = issue.state  # fallback to dispatch-time state
+                    current_state = issue.state
                     try:
                         client = self._ensure_linear_client()
                         states = await client.fetch_issue_states_by_ids([issue.id])
@@ -304,16 +618,16 @@ class Orchestrator:
                     except Exception as e:
                         logger.warning(f"State check failed, continuing: {e}")
 
-                    # Use continuation prompt
                     prompt = (
                         f"Continue working on {issue.identifier}. "
                         f"The issue is still in '{current_state}' state. "
                         f"Check your progress and continue the task."
                     )
 
-                attempt = await run_agent_turn(
-                    claude_cfg=self.cfg.claude,
-                    hooks_cfg=self.cfg.hooks,
+                attempt = await run_turn(
+                    runner_type=runner_type,
+                    claude_cfg=claude_cfg,
+                    hooks_cfg=hooks_cfg,
                     prompt=prompt,
                     workspace_path=ws.path,
                     issue=issue,
@@ -325,7 +639,6 @@ class Orchestrator:
                 if attempt.status != "succeeded":
                     break
 
-            # Worker finished
             self._on_worker_exit(issue, attempt)
 
         except asyncio.CancelledError:
@@ -338,10 +651,17 @@ class Orchestrator:
             attempt.error = str(e)
             self._on_worker_exit(issue, attempt)
 
-    def _render_prompt(self, issue: Issue, attempt_num: int | None) -> str:
-        """Render the workflow prompt template with issue context."""
+    def _render_prompt(
+        self, issue: Issue, attempt_num: int | None, stage: str | None = None
+    ) -> str:
+        """Render the prompt template with issue context."""
         assert self.workflow is not None
+
         template_str = self.workflow.prompt_template
+        if stage and stage in self._stage_configs:
+            stage_template = self._stage_configs[stage].prompt_template
+            if stage_template:
+                template_str = stage_template
 
         if not template_str:
             return f"You are working on an issue from Linear: {issue.identifier} - {issue.title}"
@@ -371,6 +691,7 @@ class Orchestrator:
                 },
                 attempt=attempt_num,
                 last_run_at=last_run_at,
+                stage=stage,
             )
         except TemplateSyntaxError as e:
             raise RuntimeError(f"Template syntax error: {e}")
@@ -388,7 +709,6 @@ class Orchestrator:
 
     def _on_worker_exit(self, issue: Issue, attempt: RunAttempt):
         """Handle worker completion."""
-        # Update aggregates
         self.total_input_tokens += attempt.input_tokens
         self.total_output_tokens += attempt.output_tokens
         self.total_tokens += attempt.total_tokens
@@ -396,25 +716,23 @@ class Orchestrator:
             elapsed = (datetime.now(timezone.utc) - attempt.started_at).total_seconds()
             self.total_seconds_running += elapsed
 
-        # Preserve session_id for future retries
         if attempt.session_id:
             self._last_session_ids[issue.id] = attempt.session_id
 
-        # Record completion time for last_run_at injection (not for canceled)
         completed_at = datetime.now(timezone.utc)
         attempt.completed_at = completed_at
         if attempt.status != "canceled":
             self._last_completed_at[issue.id] = completed_at
 
-        # Remove from running
         self.running.pop(issue.id, None)
         self._tasks.pop(issue.id, None)
 
         if attempt.status == "succeeded":
-            # Schedule continuation retry (1s) to check if issue needs more work
-            self._schedule_retry(issue, attempt_num=1, delay_ms=1000)
+            if self.cfg.pipeline and attempt.stage:
+                asyncio.create_task(self._advance_stage(issue))
+            else:
+                self._schedule_retry(issue, attempt_num=1, delay_ms=1000)
         elif attempt.status in ("failed", "timed_out", "stalled"):
-            # Schedule exponential backoff retry
             current_attempt = (attempt.attempt or 0) + 1
             delay = min(
                 10_000 * (2 ** (current_attempt - 1)),
@@ -427,7 +745,6 @@ class Orchestrator:
                 error=attempt.error,
             )
         else:
-            # Canceled or other - release claim
             self.claimed.discard(issue.id)
 
     def _schedule_retry(
@@ -560,6 +877,30 @@ class Orchestrator:
                 self._tasks.pop(issue_id, None)
                 self.claimed.discard(issue_id)
 
+            # Check for gate states (pipeline mode)
+            elif self.cfg.pipeline:
+                gate_lower = [
+                    s.strip().lower() for s in self.cfg.tracker.gate_states
+                ]
+                if state_lower in gate_lower:
+                    task = self._tasks.get(issue_id)
+                    if task:
+                        task.cancel()
+                    self.running.pop(issue_id, None)
+                    self._tasks.pop(issue_id, None)
+                    continue
+                elif state_lower not in active_lower:
+                    # Neither active nor terminal nor gate - stop without cleanup
+                    logger.info(
+                        f"Reconciliation: {issue_id} not active ({current_state}), stopping"
+                    )
+                    task = self._tasks.get(issue_id)
+                    if task:
+                        task.cancel()
+                    self.running.pop(issue_id, None)
+                    self._tasks.pop(issue_id, None)
+                    self.claimed.discard(issue_id)
+
             elif state_lower not in active_lower:
                 # Neither active nor terminal - stop without cleanup
                 logger.info(
@@ -605,6 +946,8 @@ class Orchestrator:
                         "output_tokens": r.output_tokens,
                         "total_tokens": r.total_tokens,
                     },
+                    "stage": r.stage,
+                    "runner_type": r.runner_type,
                 }
                 for r in self.running.values()
             ],
