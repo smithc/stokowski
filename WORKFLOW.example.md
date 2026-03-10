@@ -46,6 +46,8 @@ agent:
 
 # Pipeline configuration (optional - omit for legacy single-prompt mode)
 # When present, stages/ directory must contain a .md file per stage.
+# Note: When using pipeline mode, remove Rework from active_states above.
+# The pipeline handles Rework via gate_states/rework_state separately.
 # pipeline:
 #   stages:
 #     - investigate

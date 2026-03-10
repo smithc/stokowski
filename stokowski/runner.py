@@ -84,6 +84,7 @@ async def run_codex_turn(
     issue: Issue,
     attempt: RunAttempt,
     on_pid: PidCallback | None = None,
+    turn_timeout_ms: int = 3_600_000,
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
@@ -133,7 +134,7 @@ async def run_codex_turn(
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(),
-            timeout=3600,
+            timeout=turn_timeout_ms / 1000,
         )
         stdout_text = stdout_bytes.decode()[:2000] if stdout_bytes else ""
         stderr_text = stderr_bytes.decode()[:500] if stderr_bytes else ""
@@ -411,6 +412,7 @@ async def run_turn(
             issue=issue,
             attempt=attempt,
             on_pid=on_pid,
+            turn_timeout_ms=claude_cfg.turn_timeout_ms,
         )
     elif runner_type == "claude":
         return await run_agent_turn(

@@ -277,6 +277,7 @@ class Orchestrator:
         # Release from running/claimed so it doesn't block slots
         self.running.pop(issue.id, None)
         self._tasks.pop(issue.id, None)
+        self.claimed.discard(issue.id)
 
         logger.info(
             f"Gate entered issue={issue.identifier} gate={gate_name} "
@@ -321,6 +322,11 @@ class Orchestrator:
         """Check for gate-approved and rework issues, handle transitions."""
         pipeline = self.cfg.pipeline
         if not pipeline:
+            return
+
+        # Skip if no gates in pipeline
+        has_gates = any(s.startswith("gate:") for s in pipeline.stages)
+        if not has_gates:
             return
 
         client = self._ensure_linear_client()
@@ -516,9 +522,10 @@ class Orchestrator:
         stage_name = None
         runner_type = "claude"
         if self.cfg.pipeline:
-            idx = self._issue_stages.get(issue.id, 0)
-            if idx < len(self.cfg.pipeline.stages):
-                stage_name = self.cfg.pipeline.stages[idx]
+            if issue.id in self._issue_stages:
+                idx = self._issue_stages[issue.id]
+                if idx < len(self.cfg.pipeline.stages):
+                    stage_name = self.cfg.pipeline.stages[idx]
             if stage_name and stage_name.startswith("gate:"):
                 asyncio.create_task(self._enter_gate(issue, stage_name[5:]))
                 return
@@ -565,6 +572,18 @@ class Orchestrator:
     async def _run_worker(self, issue: Issue, attempt: RunAttempt):
         """Worker coroutine: prepare workspace, run agent turns."""
         try:
+            # Resolve pipeline stage (reads tracking comments on first dispatch)
+            if self.cfg.pipeline and not attempt.stage:
+                idx, stage_name = await self._resolve_current_stage(issue)
+                attempt.stage = stage_name if not stage_name.startswith("gate:") else None
+                if stage_name.startswith("gate:"):
+                    # Issue should be at a gate, not running
+                    await self._enter_gate(issue, stage_name[5:])
+                    return
+                stage_cfg = self._stage_configs.get(stage_name)
+                if stage_cfg:
+                    attempt.runner_type = stage_cfg.runner
+
             claude_cfg = self.cfg.claude
             hooks_cfg = self.cfg.hooks
             runner_type = attempt.runner_type
@@ -581,19 +600,20 @@ class Orchestrator:
             ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
             attempt.workspace_path = str(ws.path)
 
-            # Post stage tracking comment
+            # Post stage tracking comment (only for first stage — _advance_stage handles subsequent)
             if self.cfg.pipeline and attempt.stage:
                 pipeline = self.cfg.pipeline
                 idx = self._issue_stages.get(issue.id, 0)
                 pipeline_run = self._issue_pipeline_runs.get(issue.id, 1)
-                client = self._ensure_linear_client()
-                comment = make_stage_comment(
-                    stage=attempt.stage,
-                    index=idx,
-                    total=len(pipeline.stages),
-                    pipeline_run=pipeline_run,
-                )
-                await client.post_comment(issue.id, comment)
+                if idx == 0 and pipeline_run == 1 and (attempt.attempt is None or attempt.attempt == 0):
+                    client = self._ensure_linear_client()
+                    comment = make_stage_comment(
+                        stage=attempt.stage,
+                        index=idx,
+                        total=len(pipeline.stages),
+                        pipeline_run=pipeline_run,
+                    )
+                    await client.post_comment(issue.id, comment)
 
             prompt = self._render_prompt(issue, attempt.attempt, attempt.stage)
 
