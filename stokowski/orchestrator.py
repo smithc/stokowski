@@ -295,10 +295,27 @@ class Orchestrator:
 
         if next_idx >= len(pipeline.stages):
             logger.info(f"Pipeline complete issue={issue.identifier}")
+            # Move issue to terminal state
+            terminal_state = self.cfg.tracker.terminal_states[0] if self.cfg.tracker.terminal_states else "Done"
+            try:
+                client = self._ensure_linear_client()
+                await client.update_issue_state(issue.id, terminal_state)
+                logger.info(f"Moved issue {issue.identifier} to terminal state '{terminal_state}'")
+            except Exception as e:
+                logger.warning(f"Failed to move {issue.identifier} to terminal: {e}")
+            # Clean up workspace
+            try:
+                ws_root = self.cfg.workspace.resolved_root()
+                await remove_workspace(ws_root, issue.identifier, self.cfg.hooks)
+            except Exception as e:
+                logger.warning(f"Failed to remove workspace for {issue.identifier}: {e}")
+            # Clean up tracking state
             self._issue_stages.pop(issue.id, None)
             self._issue_pipeline_runs.pop(issue.id, None)
             self._pending_gates.pop(issue.id, None)
+            self._last_session_ids.pop(issue.id, None)
             self.claimed.discard(issue.id)
+            self.completed.add(issue.id)
             return
 
         next_stage = pipeline.stages[next_idx]
