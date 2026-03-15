@@ -8,6 +8,18 @@ All notable changes to Stokowski are documented here.
 
 ---
 
+## [0.2.2] - 2026-03-15
+
+### Added
+
+- feat: add todo state — pick up issues from Todo and move to In Progress automatically (94b9d02)
+
+### Fixed
+
+- fix: read `__version__` from package metadata instead of hardcoded string — update checker now shows correct version (ae74016)
+
+---
+
 ## [0.2.1] - 2026-03-15
 
 ### Fixed
@@ -84,7 +96,8 @@ All notable changes to Stokowski are documented here.
 
 ---
 
-[Unreleased]: https://github.com/Sugar-Coffee/stokowski/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Sugar-Coffee/stokowski/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Sugar-Coffee/stokowski/releases/tag/v0.2.2
 [0.2.1]: https://github.com/Sugar-Coffee/stokowski/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Sugar-Coffee/stokowski/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Sugar-Coffee/stokowski/releases/tag/v0.1.0
