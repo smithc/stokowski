@@ -1,0 +1,22 @@
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./workflow.yaml:/app/workflow.yaml:ro
+      - ./prompts:/app/prompts:ro
+    env_file: .env
+    environment:
+      - HOST_HOME=${HOME}
+    ports:
+      - "${STOKOWSKI_PORT:-4200}:4200"
+    command: ["workflow.yaml", "--port", "4200"]
+    restart: unless-stopped
+
+# Per-issue workspace volumes (stokowski-ws-*) are created dynamically
+# by the orchestrator via `docker volume create`. The sessions volume
+# is only needed when inherit_claude_config is false.
+volumes:
+  stokowski-sessions:

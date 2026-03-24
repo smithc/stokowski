@@ -70,6 +70,20 @@ class AgentConfig:
 
 
 @dataclass
+class DockerConfig:
+    """Docker isolation settings for agent containers."""
+    enabled: bool = False
+    default_image: str = ""
+    inherit_claude_config: bool = True
+    host_claude_dir: str = "~/.claude"
+    extra_env: list[str] = field(default_factory=list)
+    extra_volumes: list[str] = field(default_factory=list)
+    volume_prefix: str = "stokowski-ws"
+    sessions_volume: str = "stokowski-sessions"
+    init: bool = True
+
+
+@dataclass
 class ServerConfig:
     port: int | None = None
 
@@ -110,6 +124,7 @@ class StateConfig:
     max_rework: int | None = None    # gate only
     transitions: dict[str, str] = field(default_factory=dict)
     hooks: HooksConfig | None = None
+    docker_image: str | None = None           # Override default_image for this state
 
 
 @dataclass
@@ -129,6 +144,7 @@ class ServiceConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     linear_states: LinearStatesConfig = field(default_factory=LinearStatesConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
+    docker: DockerConfig = field(default_factory=DockerConfig)
     states: dict[str, StateConfig] = field(default_factory=dict)
 
     def resolved_api_key(self) -> str:
@@ -153,6 +169,31 @@ class ServiceConfig:
             env["LINEAR_PROJECT_SLUG"] = self.tracker.project_slug
         if self.tracker.endpoint:
             env["LINEAR_ENDPOINT"] = self.tracker.endpoint
+        return env
+
+    def docker_env(self) -> dict[str, str]:
+        """Build minimal env vars for Docker agent containers.
+
+        Unlike agent_env() which inherits the full parent environment,
+        Docker mode only forwards explicitly declared variables to
+        maintain container isolation.
+        """
+        env: dict[str, str] = {}
+        api_key = self.resolved_api_key()
+        if api_key:
+            env["LINEAR_API_KEY"] = api_key
+        if self.tracker.project_slug:
+            env["LINEAR_PROJECT_SLUG"] = self.tracker.project_slug
+        if self.tracker.endpoint:
+            env["LINEAR_ENDPOINT"] = self.tracker.endpoint
+        if not self.docker.inherit_claude_config:
+            ak = os.environ.get("ANTHROPIC_API_KEY", "")
+            if ak:
+                env["ANTHROPIC_API_KEY"] = ak
+        for var_name in self.docker.extra_env:
+            val = os.environ.get(var_name, "")
+            if val:
+                env[var_name] = val
         return env
 
     @property
@@ -266,6 +307,7 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         max_rework=raw.get("max_rework"),
         transitions=raw.get("transitions") or {},
         hooks=_parse_hooks(hooks_raw) if hooks_raw else None,
+        docker_image=raw.get("docker_image") or (raw.get("docker", {}) or {}).get("image"),
     )
 
 
@@ -385,6 +427,20 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         global_prompt=pr_raw.get("global_prompt"),
     )
 
+    # Parse docker
+    dk = config_raw.get("docker", {}) or {}
+    docker = DockerConfig(
+        enabled=bool(dk.get("enabled", False)),
+        default_image=str(dk.get("default_image", "")),
+        inherit_claude_config=bool(dk.get("inherit_claude_config", True)),
+        host_claude_dir=str(dk.get("host_claude_dir", "~/.claude")),
+        extra_env=_coerce_list(dk.get("extra_env")),
+        extra_volumes=_coerce_list(dk.get("extra_volumes")),
+        volume_prefix=str(dk.get("volume_prefix", "stokowski-ws")),
+        sessions_volume=str(dk.get("sessions_volume", "stokowski-sessions")),
+        init=bool(dk.get("init", True)),
+    )
+
     # Parse states
     states_raw = config_raw.get("states", {}) or {}
     states: dict[str, StateConfig] = {}
@@ -402,6 +458,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         server=server,
         linear_states=linear_states,
         prompts=prompts,
+        docker=docker,
         states=states,
     )
 
@@ -493,5 +550,23 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
     unreachable = all_state_names - reachable
     for name in unreachable:
         log.warning("State '%s' is unreachable (no transitions lead to it)", name)
+
+    # Docker validation
+    if cfg.docker.enabled:
+        if not cfg.docker.default_image:
+            errors.append("docker.enabled is true but docker.default_image is not set")
+        if cfg.docker.inherit_claude_config:
+            host_dir = os.path.expandvars(os.path.expanduser(cfg.docker.host_claude_dir))
+            if not Path(host_dir).exists():
+                log.warning(
+                    "docker.host_claude_dir '%s' does not exist — "
+                    "agents may fail to authenticate",
+                    host_dir,
+                )
+    for name, sc in cfg.states.items():
+        if sc.docker_image and not cfg.docker.enabled:
+            log.warning(
+                "State '%s' has docker_image set but docker.enabled is false", name
+            )
 
     return errors

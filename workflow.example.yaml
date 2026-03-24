@@ -110,6 +110,20 @@ server:
   port: 4200
 
 # ---------------------------------------------------------------------------
+# Docker isolation (optional — agents run as sibling containers)
+# ---------------------------------------------------------------------------
+# docker:
+#   enabled: true
+#   default_image: "stokowski/claude-agent:latest"
+#   inherit_claude_config: true
+#   host_claude_dir: "${HOST_HOME}/.claude"
+#   extra_env:
+#     - GITHUB_TOKEN
+#   extra_volumes:
+#     - "${HOST_HOME}/.ssh:/root/.ssh:ro"
+#     - "${HOST_HOME}/.gitconfig:/root/.gitconfig:ro"
+
+# ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
 #

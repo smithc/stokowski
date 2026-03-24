@@ -23,6 +23,11 @@ from .config import (
     parse_workflow_file,
     validate_config,
 )
+from .docker_runner import (
+    check_docker_available,
+    cleanup_orphaned_containers,
+    pull_image,
+)
 from .linear import LinearClient
 from .models import Issue, RetryEntry, RunAttempt
 from .prompt import assemble_prompt, build_lifecycle_section
@@ -95,6 +100,21 @@ class Orchestrator:
                 logger.error(f"Config error: {e}")
             raise RuntimeError(f"Startup validation failed: {errors}")
 
+        # Docker startup checks
+        if self.cfg.docker.enabled:
+            ok, msg = await check_docker_available()
+            if not ok:
+                raise RuntimeError(f"Docker mode enabled but: {msg}")
+            # Pre-pull all configured images
+            images = {self.cfg.docker.default_image}
+            for sc in self.cfg.states.values():
+                if sc.docker_image:
+                    images.add(sc.docker_image)
+            for img in images:
+                logger.info(f"Pulling Docker image: {img}")
+                if not await pull_image(img):
+                    logger.warning(f"Failed to pull image: {img} (may already be cached)")
+
         logger.info(
             f"Starting Stokowski "
             f"project={self.cfg.tracker.project_slug} "
@@ -142,6 +162,13 @@ class Orchestrator:
                     pass
         self._child_pids.clear()
 
+        # Kill Docker agent containers by label
+        if self.cfg.docker.enabled:
+            try:
+                await cleanup_orphaned_containers()
+            except Exception:
+                pass
+
         # Cancel async tasks
         for issue_id, task in list(self._tasks.items()):
             task.cancel()
@@ -155,6 +182,11 @@ class Orchestrator:
 
     async def _startup_cleanup(self):
         """Remove workspaces for issues already in terminal states."""
+        if self.cfg.docker.enabled:
+            count = await cleanup_orphaned_containers()
+            if count:
+                logger.info(f"Killed {count} orphaned agent containers")
+
         try:
             client = self._ensure_linear_client()
             terminal = await client.fetch_issues_by_states(
@@ -163,7 +195,10 @@ class Orchestrator:
             )
             ws_root = self.cfg.workspace.resolved_root()
             for issue in terminal:
-                await remove_workspace(ws_root, issue.identifier, self.cfg.hooks)
+                await remove_workspace(
+                    ws_root, issue.identifier, self.cfg.hooks,
+                    docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                )
             if terminal:
                 logger.info(f"Cleaned {len(terminal)} terminal workspaces")
         except Exception as e:
@@ -360,7 +395,10 @@ class Orchestrator:
             # Clean up workspace
             try:
                 ws_root = self.cfg.workspace.resolved_root()
-                await remove_workspace(ws_root, issue.identifier, self.cfg.hooks)
+                await remove_workspace(
+                    ws_root, issue.identifier, self.cfg.hooks,
+                    docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                )
             except Exception as e:
                 logger.warning(f"Failed to remove workspace for {issue.identifier}: {e}")
             # Clean up tracking state
@@ -688,7 +726,17 @@ class Orchestrator:
                 runner_type = state_cfg.runner
 
             ws_root = self.cfg.workspace.resolved_root()
-            ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
+            docker_image = ""
+            if self.cfg.docker.enabled:
+                docker_image = (
+                    (state_cfg.docker_image if state_cfg else None)
+                    or self.cfg.docker.default_image
+                )
+            ws = await ensure_workspace(
+                ws_root, issue.identifier, self.cfg.hooks,
+                docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                docker_image=docker_image,
+            )
             attempt.workspace_path = str(ws.path)
 
             # Move issue from Todo to In Progress if needed
@@ -730,6 +778,9 @@ class Orchestrator:
                     ws.path,
                     (state_cfg.hooks.timeout_ms if state_cfg.hooks else self.cfg.hooks.timeout_ms),
                     f"on_stage_enter:{state_name}",
+                    docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                    docker_image=docker_image,
+                    workspace_key=ws.workspace_key,
                 )
                 if not ok:
                     attempt.status = "failed"
@@ -740,7 +791,10 @@ class Orchestrator:
             prompt = await self._render_prompt_async(issue, attempt.attempt, state_name)
 
             # Build env vars for the agent subprocess from workflow.yaml config
-            agent_env = self.cfg.agent_env()
+            if self.cfg.docker.enabled:
+                agent_env = self.cfg.docker_env()
+            else:
+                agent_env = self.cfg.agent_env()
 
             # State machine mode: single turn per dispatch. The state
             # machine handles continuation via _transition after each
@@ -759,6 +813,9 @@ class Orchestrator:
                     on_event=self._on_agent_event,
                     on_pid=self._on_child_pid,
                     env=agent_env,
+                    docker_cfg=self.cfg.docker,
+                    workspace_key=ws.workspace_key,
+                    docker_image=docker_image,
                 )
             else:
                 # Legacy mode: multi-turn loop
@@ -800,6 +857,9 @@ class Orchestrator:
                         on_event=self._on_agent_event,
                         on_pid=self._on_child_pid,
                         env=agent_env,
+                        docker_cfg=self.cfg.docker,
+                        workspace_key=ws.workspace_key,
+                        docker_image=docker_image,
                     )
 
                     if attempt.status != "succeeded":
@@ -1090,7 +1150,8 @@ class Orchestrator:
                 if attempt:
                     ws_root = self.cfg.workspace.resolved_root()
                     await remove_workspace(
-                        ws_root, attempt.issue_identifier, self.cfg.hooks
+                        ws_root, attempt.issue_identifier, self.cfg.hooks,
+                        docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                     )
 
                 self.running.pop(issue_id, None)
@@ -1152,6 +1213,7 @@ class Orchestrator:
                         "total_tokens": r.total_tokens,
                     },
                     "state_name": r.state_name,
+                    "container_name": r.container_name,
                 }
                 for r in self.running.values()
             ],
