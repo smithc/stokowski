@@ -134,6 +134,8 @@ def build_docker_run_args(
         # Claude Code also reads ~/.claude.json for its main config
         host_json = os.path.join(os.path.dirname(host_dir), ".claude.json")
         args.extend(["-v", f"{host_json}:{home}/.claude.json"])
+        # Pass host claude dir so entrypoint can rewrite plugin paths
+        args.extend(["-e", f"STOKOWSKI_HOST_CLAUDE_DIR={host_dir}"])
     else:
         args.extend(["-v", f"{docker_cfg.sessions_volume}:/home/agent/.claude"])
 
@@ -153,10 +155,35 @@ def build_docker_run_args(
     # Image
     args.append(image)
 
-    # Inner command
-    args.extend(command)
+    # Wrap command: rewrite plugin paths then exec the original command.
+    # installed_plugins.json stores absolute host paths (e.g. /Users/foo/.claude/...)
+    # which don't exist inside the container. Rewrite them to /home/agent/.claude/...
+    if docker_cfg.inherit_claude_config:
+        escaped_cmd = " ".join(_shell_escape(c) for c in command)
+        fixup_script = (
+            'PLUGINS="$HOME/.claude/plugins/installed_plugins.json"; '
+            'if [ -n "$STOKOWSKI_HOST_CLAUDE_DIR" ] && [ -f "$PLUGINS" ]; then '
+            'sed -i "s|$STOKOWSKI_HOST_CLAUDE_DIR|$HOME/.claude|g" "$PLUGINS" 2>/dev/null; '
+            "fi; "
+            f"exec {escaped_cmd}"
+        )
+        args.extend(["bash", "-c", fixup_script])
+    else:
+        args.extend(command)
 
     return args
+
+
+def _shell_escape(s: str) -> str:
+    """Escape a string for safe inclusion in a shell command."""
+    if not s:
+        return "''"
+    # If the string is safe as-is (no special chars), return it unquoted
+    import re as _re
+    if _re.match(r"^[A-Za-z0-9_./:=@-]+$", s):
+        return s
+    # Otherwise, single-quote it (escaping any embedded single quotes)
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def container_name_for(
