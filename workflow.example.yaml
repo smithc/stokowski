@@ -119,9 +119,21 @@ server:
 #   host_claude_dir: "${HOST_HOME}/.claude"
 #   extra_env:
 #     - GITHUB_TOKEN
+#     - CLAUDE_CODE_OAUTH_TOKEN    # required for Claude Code auth in containers
 #   extra_volumes:
 #     - "${HOST_HOME}/.ssh:/root/.ssh:ro"
 #     - "${HOST_HOME}/.gitconfig:/root/.gitconfig:ro"
+#
+# Authentication for Docker mode:
+#   Claude Code in containers cannot use interactive OAuth login. Set one of:
+#     ANTHROPIC_API_KEY           — standard API key (API plan required)
+#     CLAUDE_CODE_OAUTH_TOKEN     — long-lived token for Pro/Max users
+#
+#   Generate an OAuth token by running `claude setup-token` in your terminal,
+#   then add it to your .env file:
+#     CLAUDE_CODE_OAUTH_TOKEN=your_generated_token_here
+#
+#   Add CLAUDE_CODE_OAUTH_TOKEN to extra_env so it reaches agent containers.
 
 # ---------------------------------------------------------------------------
 # State machine
