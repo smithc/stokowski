@@ -19,6 +19,7 @@ from .config import (
     ServiceConfig,
     StateConfig,
     ParsedConfig,
+    WorkflowConfig,
     merge_state_config,
     parse_workflow_file,
     validate_config,
@@ -71,6 +72,7 @@ class Orchestrator:
         self._issue_current_state: dict[str, str] = {}   # issue_id -> internal state name
         self._issue_state_runs: dict[str, int] = {}       # issue_id -> run number for current state
         self._pending_gates: dict[str, str] = {}           # issue_id -> gate state name
+        self._issue_workflow: dict[str, str] = {}          # issue_id -> workflow name
 
         # Cancellation tracking
         self._force_cancelled: set[str] = set()  # issue_ids cancelled by reconciliation
@@ -155,6 +157,7 @@ class Orchestrator:
         self._issue_current_state.pop(issue_id, None)
         self._issue_state_runs.pop(issue_id, None)
         self._pending_gates.pop(issue_id, None)
+        self._issue_workflow.pop(issue_id, None)
         # -- Session/timing --
         self._last_session_ids.pop(issue_id, None)
         self._last_completed_at.pop(issue_id, None)
@@ -325,14 +328,63 @@ class Orchestrator:
 
         await self._cleanup_logs()
 
+    def _resolve_workflow(self, issue: Issue) -> WorkflowConfig:
+        """Resolve which workflow applies to an issue and cache the result.
+
+        Calls ``self.cfg.resolve_workflow(issue)`` (label matching + default
+        fallback), then caches the workflow name in ``_issue_workflow``.
+        """
+        workflow = self.cfg.resolve_workflow(issue)
+        self._issue_workflow[issue.id] = workflow.name
+        return workflow
+
+    def _get_issue_workflow_config(self, issue_id: str) -> WorkflowConfig:
+        """Look up the cached workflow for an issue, with fallbacks.
+
+        Resolution order:
+        1. Cached name in ``_issue_workflow`` → look up via ``cfg.get_workflow``
+        2. If cached name exists but workflow was removed (hot-reload) → re-resolve
+           from the issue's labels (via ``_last_issues`` cache), or fall back to default
+        3. If not cached at all → return the default workflow
+        """
+        cached_name = self._issue_workflow.get(issue_id)
+        if cached_name is not None:
+            wf = self.cfg.get_workflow(cached_name)
+            if wf is not None:
+                return wf
+            # Workflow was removed by hot-reload — try to re-resolve from labels
+            cached_issue = self._last_issues.get(issue_id)
+            if cached_issue is not None:
+                try:
+                    return self._resolve_workflow(cached_issue)
+                except ValueError:
+                    pass  # No default — fall through
+        # Not cached or resolution failed — return default workflow
+        for wf in self.cfg.workflows.values():
+            if wf.default:
+                return wf
+        # Last resort: return first workflow (should not happen with valid config)
+        if self.cfg.workflows:
+            return next(iter(self.cfg.workflows.values()))
+        raise RuntimeError("No workflows defined in config")
+
     async def _resolve_current_state(self, issue: Issue) -> tuple[str, int]:
         """Resolve current state machine state for an issue.
         Returns (state_name, run).
+
+        Workflow-aware: uses tracking comments to recover the workflow, then
+        validates the tracked state against the resolved workflow's path.
+        Respects cached ``_issue_workflow`` for claimed issues to prevent
+        retry race conditions (a ``_tick()`` call must not overwrite the
+        workflow while a ``call_later()`` retry is in-flight).
         """
-        # Check cache first
+        # Check state cache first
         if issue.id in self._issue_current_state:
             state_name = self._issue_current_state[issue.id]
             run = self._issue_state_runs.get(issue.id, 1)
+            # Ensure _issue_workflow is populated (may be missing after restart)
+            if issue.id not in self._issue_workflow:
+                self._resolve_workflow(issue)
             return state_name, run
 
         # Fetch comments from Linear and parse latest tracking
@@ -340,9 +392,33 @@ class Orchestrator:
         comments = await client.fetch_comments(issue.id)
         tracking = parse_latest_tracking(comments)
 
-        entry = self.cfg.entry_state
-        if entry is None:
-            raise RuntimeError("No entry state defined in config")
+        # --- Resolve workflow ---
+        # Respect cached _issue_workflow for claimed issues (retry race prevention).
+        # Only resolve fresh from labels for unclaimed issues.
+        workflow: WorkflowConfig | None = None
+        if issue.id in self._issue_workflow:
+            workflow = self._get_issue_workflow_config(issue.id)
+        elif tracking is not None:
+            # Extract workflow field from tracking comment
+            tracked_wf_name = tracking.get("workflow")
+            if tracked_wf_name is not None:
+                wf_from_tracking = self.cfg.get_workflow(tracked_wf_name)
+                if wf_from_tracking is not None:
+                    workflow = wf_from_tracking
+                    self._issue_workflow[issue.id] = workflow.name
+            # If tracking had no workflow field or the workflow no longer exists,
+            # resolve from issue labels
+            if workflow is None:
+                workflow = self._resolve_workflow(issue)
+        else:
+            # No tracking at all — resolve from issue labels
+            workflow = self._resolve_workflow(issue)
+
+        entry = workflow.entry_state
+        if not entry:
+            raise RuntimeError(
+                f"No entry state in workflow '{workflow.name}'"
+            )
 
         # No tracking → entry state, run 1
         if tracking is None:
@@ -350,14 +426,25 @@ class Orchestrator:
             self._issue_state_runs[issue.id] = 1
             return entry, 1
 
+        # Helper: validate state exists in workflow path (not just states pool)
+        workflow_path_set = set(workflow.path)
+
         if tracking["type"] == "state":
             state_name = tracking.get("state", entry)
             run = tracking.get("run", 1)
-            if state_name in self.cfg.states:
+            if state_name in self.cfg.states and state_name in workflow_path_set:
+                # State exists and is in workflow path — use it
                 self._issue_current_state[issue.id] = state_name
                 self._issue_state_runs[issue.id] = run
                 return state_name, run
-            # Unknown state → fallback to entry
+            if state_name in self.cfg.states:
+                # State exists in pool but NOT in workflow path — workflow may
+                # have changed. Treat as workflow entry.
+                logger.info(
+                    f"State '{state_name}' not in workflow '{workflow.name}' path, "
+                    f"resetting to entry '{entry}' for {issue.identifier}"
+                )
+            # Unknown state or not in path → fallback to entry
             self._issue_current_state[issue.id] = entry
             self._issue_state_runs[issue.id] = 1
             return entry, 1
@@ -368,31 +455,42 @@ class Orchestrator:
             run = tracking.get("run", 1)
 
             if status == "waiting":
-                if gate_state in self.cfg.states:
+                if gate_state in self.cfg.states and gate_state in workflow_path_set:
                     self._issue_current_state[issue.id] = gate_state
                     self._issue_state_runs[issue.id] = run
                     self._pending_gates[issue.id] = gate_state
                     return gate_state, run
 
             elif status == "approved":
-                gate_cfg = self.cfg.states.get(gate_state)
-                if gate_cfg and "approve" in gate_cfg.transitions:
-                    target = gate_cfg.transitions["approve"]
+                # Resolve approve transition using workflow transitions
+                wf_transitions = workflow.transitions.get(gate_state, {})
+                target = wf_transitions.get("approve")
+                if not target:
+                    # Fallback to StateConfig transitions for backward compat
+                    gate_cfg = self.cfg.states.get(gate_state)
+                    if gate_cfg:
+                        target = gate_cfg.transitions.get("approve")
+                if target and target in self.cfg.states:
                     self._issue_current_state[issue.id] = target
                     self._issue_state_runs[issue.id] = run
                     return target, run
 
             elif status == "rework":
-                gate_cfg = self.cfg.states.get(gate_state)
+                # Resolve rework_to using workflow transitions, then StateConfig fallback
+                wf_transitions = workflow.transitions.get(gate_state, {})
                 rework_to = tracking.get("rework_to", "")
-                if not rework_to and gate_cfg:
-                    rework_to = gate_cfg.rework_to or ""
+                if not rework_to:
+                    rework_to = wf_transitions.get("rework_to", "")
+                if not rework_to:
+                    gate_cfg = self.cfg.states.get(gate_state)
+                    if gate_cfg:
+                        rework_to = gate_cfg.rework_to or ""
                 if rework_to and rework_to in self.cfg.states:
                     self._issue_current_state[issue.id] = rework_to
                     self._issue_state_runs[issue.id] = run
                     return rework_to, run
 
-        # Fallback to entry state
+        # Fallback to workflow entry state
         self._issue_current_state[issue.id] = entry
         self._issue_state_runs[issue.id] = 1
         return entry, 1
@@ -826,7 +924,7 @@ class Orchestrator:
 
         state_name = self._issue_current_state.get(issue.id)
         if not state_name:
-            state_name = self.cfg.entry_state
+            state_name = self._get_issue_workflow_config(issue.id).entry_state or self.cfg.entry_state
 
         # If at a gate, enter it instead of dispatching a worker
         state_cfg = self.cfg.states.get(state_name) if state_name else None
@@ -1490,6 +1588,7 @@ class Orchestrator:
                     },
                     "state_name": r.state_name,
                     "container_name": r.container_name,
+                    "workflow": self._issue_workflow.get(r.issue_id),
                 }
                 for r in self.running.values()
             ],
@@ -1508,6 +1607,7 @@ class Orchestrator:
                     "issue_identifier": self._last_issues.get(issue_id, Issue(id="", identifier=issue_id, title="")).identifier,
                     "gate_state": gate_state,
                     "run": self._issue_state_runs.get(issue_id, 1),
+                    "workflow": self._issue_workflow.get(issue_id),
                 }
                 for issue_id, gate_state in self._pending_gates.items()
             ],

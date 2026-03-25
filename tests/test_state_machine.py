@@ -1442,3 +1442,241 @@ class TestWorkflowValidation:
         cfg = self._make_multi_cfg(states, {"wf1": wf1, "wf2": wf2})
         errors = validate_config(cfg)
         assert any("Multiple default workflows" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator workflow routing (Unit 5)
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorWorkflowRouting:
+    """Tests for _resolve_workflow, _get_issue_workflow_config, and
+    the cleanup contract for _issue_workflow."""
+
+    @staticmethod
+    def _make_cfg(
+        states: dict[str, StateConfig],
+        workflows: dict[str, WorkflowConfig],
+    ) -> ServiceConfig:
+        return ServiceConfig(
+            tracker=TrackerConfig(
+                kind="linear", api_key="test-key", project_slug="abc123",
+            ),
+            states=states,
+            workflows=workflows,
+        )
+
+    @staticmethod
+    def _make_states() -> dict[str, StateConfig]:
+        return {
+            "classify": StateConfig(name="classify", type="agent", prompt="p.md"),
+            "plan": StateConfig(name="plan", type="agent", prompt="p.md"),
+            "implement": StateConfig(name="implement", type="agent", prompt="p.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+
+    @staticmethod
+    def _make_workflows(states: dict[str, StateConfig]) -> dict[str, WorkflowConfig]:
+        qf_path = ["plan", "implement", "done"]
+        tr_path = ["classify", "done"]
+        return {
+            "quick-fix": WorkflowConfig(
+                name="quick-fix",
+                label="workflow:quick-fix",
+                default=False,
+                path=qf_path,
+                transitions=derive_workflow_transitions(qf_path, states),
+                entry_state="plan",
+            ),
+            "triage": WorkflowConfig(
+                name="triage",
+                label=None,
+                default=True,
+                terminal_state="todo",
+                path=tr_path,
+                transitions=derive_workflow_transitions(tr_path, states),
+                entry_state="classify",
+            ),
+        }
+
+    @staticmethod
+    def _make_issue(labels=None, **kwargs):
+        defaults = dict(id="test-id", identifier="TEST-1", title="Test issue")
+        defaults.update(kwargs)
+        issue = Issue(**defaults)
+        if labels is not None:
+            issue.labels = labels
+        return issue
+
+    def _make_orch(self, tmp_path):
+        """Create a minimal Orchestrator with a loaded workflow."""
+        from stokowski.orchestrator import Orchestrator
+
+        # Write a valid multi-workflow config
+        wf_path = tmp_path / "workflow.yaml"
+        wf_path.write_text("""
+tracker:
+  api_key: test-key
+  project_slug: abc123
+
+states:
+  classify:
+    type: agent
+    prompt: prompts/classify.md
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  implement:
+    type: agent
+    prompt: prompts/impl.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  quick-fix:
+    label: "workflow:quick-fix"
+    path: [plan, implement, done]
+  triage:
+    default: true
+    terminal_state: todo
+    path: [classify, done]
+""")
+        orch = Orchestrator(str(wf_path))
+        errors = orch._load_workflow()
+        assert not errors, f"Config errors: {errors}"
+        return orch
+
+    # --- _resolve_workflow ---
+
+    def test_resolve_workflow_label_match(self, tmp_path):
+        """Issue with matching label resolves to correct workflow and is cached."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["workflow:quick-fix", "bug"])
+
+        wf = orch._resolve_workflow(issue)
+        assert wf.name == "quick-fix"
+        assert orch._issue_workflow[issue.id] == "quick-fix"
+
+    def test_resolve_workflow_no_label_returns_default(self, tmp_path):
+        """Issue with no matching label resolves to default workflow."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["bug", "enhancement"])
+
+        wf = orch._resolve_workflow(issue)
+        assert wf.name == "triage"
+        assert wf.default is True
+        assert orch._issue_workflow[issue.id] == "triage"
+
+    def test_resolve_workflow_no_labels(self, tmp_path):
+        """Issue with empty labels resolves to default workflow."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=[])
+
+        wf = orch._resolve_workflow(issue)
+        assert wf.name == "triage"
+
+    # --- _get_issue_workflow_config ---
+
+    def test_get_workflow_config_cached(self, tmp_path):
+        """Returns cached workflow when name is in _issue_workflow."""
+        orch = self._make_orch(tmp_path)
+        orch._issue_workflow["test-id"] = "quick-fix"
+
+        wf = orch._get_issue_workflow_config("test-id")
+        assert wf.name == "quick-fix"
+
+    def test_get_workflow_config_not_cached_returns_default(self, tmp_path):
+        """Returns default workflow when issue_id is not cached."""
+        orch = self._make_orch(tmp_path)
+
+        wf = orch._get_issue_workflow_config("unknown-id")
+        assert wf.default is True
+        assert wf.name == "triage"
+
+    def test_get_workflow_config_stale_cache_resolves_from_labels(self, tmp_path):
+        """When cached workflow name no longer exists, re-resolves from labels."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["workflow:quick-fix"])
+        orch._issue_workflow["test-id"] = "removed-workflow"  # stale
+        orch._last_issues["test-id"] = issue
+
+        wf = orch._get_issue_workflow_config("test-id")
+        # Should have re-resolved from labels
+        assert wf.name == "quick-fix"
+        assert orch._issue_workflow["test-id"] == "quick-fix"
+
+    def test_get_workflow_config_stale_cache_no_issue_returns_default(self, tmp_path):
+        """When cached workflow removed and no issue in cache, returns default."""
+        orch = self._make_orch(tmp_path)
+        orch._issue_workflow["test-id"] = "removed-workflow"
+        # No _last_issues entry
+
+        wf = orch._get_issue_workflow_config("test-id")
+        assert wf.default is True
+
+    # --- _cleanup_issue_state ---
+
+    def test_cleanup_removes_workflow(self, tmp_path):
+        """_cleanup_issue_state removes the _issue_workflow entry."""
+        orch = self._make_orch(tmp_path)
+        # Pre-populate all per-issue dicts that cleanup touches
+        issue_id = "test-cleanup"
+        orch._issue_workflow[issue_id] = "quick-fix"
+        orch._issue_current_state[issue_id] = "plan"
+        orch._issue_state_runs[issue_id] = 1
+        orch.claimed.add(issue_id)
+
+        orch._cleanup_issue_state(issue_id)
+
+        assert issue_id not in orch._issue_workflow
+        assert issue_id not in orch._issue_current_state
+        assert issue_id not in orch._issue_state_runs
+        assert issue_id not in orch.claimed
+
+    # --- Dispatch uses workflow entry state ---
+
+    def test_dispatch_uses_workflow_entry_state(self, tmp_path):
+        """_dispatch uses the workflow's entry state, not cfg.entry_state."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["workflow:quick-fix"])
+        # Pre-resolve the workflow
+        orch._resolve_workflow(issue)
+        # Do NOT set _issue_current_state — force dispatch to use fallback
+
+        # Dispatch will try to create a task, which requires a running loop;
+        # we just test that the state_name is correctly resolved
+        state_name = orch._issue_current_state.get(issue.id)
+        assert state_name is None  # not set yet
+
+        # The fallback in _dispatch is:
+        #   state_name = self._get_issue_workflow_config(issue.id).entry_state
+        wf = orch._get_issue_workflow_config(issue.id)
+        assert wf.entry_state == "plan"  # quick-fix entry
+
+        # Verify triage would give a different entry
+        issue2 = self._make_issue(labels=[], id="test-id-2")
+        orch._resolve_workflow(issue2)
+        wf2 = orch._get_issue_workflow_config(issue2.id)
+        assert wf2.entry_state == "classify"  # triage entry
+
+    # --- State snapshot includes workflow ---
+
+    def test_state_snapshot_includes_workflow(self, tmp_path):
+        """get_state_snapshot includes workflow name for running and gated issues."""
+        orch = self._make_orch(tmp_path)
+        issue_id = "snap-test"
+        orch._issue_workflow[issue_id] = "quick-fix"
+        orch.running[issue_id] = RunAttempt(
+            issue_id=issue_id,
+            issue_identifier="TEST-99",
+            state_name="plan",
+        )
+        orch._pending_gates["gate-test"] = "review-gate"
+        orch._issue_workflow["gate-test"] = "full-ce"
+
+        snapshot = orch.get_state_snapshot()
+        running_entry = snapshot["running"][0]
+        assert running_entry["workflow"] == "quick-fix"
+        gate_entry = snapshot["gates"][0]
+        assert gate_entry["workflow"] == "full-ce"
