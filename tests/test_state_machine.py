@@ -16,13 +16,15 @@ import pytest
 
 from stokowski.config import (
     LinearStatesConfig,
+    ServiceConfig,
     StateConfig,
     WorkflowConfig,
     _coerce_list,
     _parse_state_config,
     derive_workflow_transitions,
+    parse_workflow_file,
 )
-from stokowski.models import RunAttempt
+from stokowski.models import Issue, RunAttempt
 from stokowski.prompt import build_lifecycle_section
 from stokowski.runner import TRANSITION_PATTERN
 from stokowski.tracking import (
@@ -614,3 +616,398 @@ class TestTrackingWorkflowField:
         assert result is not None
         assert result["workflow"] == "quick-fix"
         assert result["state"] == "implement"
+
+
+# ---------------------------------------------------------------------------
+# Workflow config parsing (Unit 2)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowConfigParsing:
+    """Tests for parsing the workflows: section and backward-compatible synthesis."""
+
+    def _write_yaml(self, tmp_path, content: str):
+        """Write a YAML string to a temp file and return its path."""
+        p = tmp_path / "workflow.yaml"
+        p.write_text(content)
+        return p
+
+    def _make_issue(self, labels: list[str] | None = None, **kwargs):
+        defaults = dict(id="test-id", identifier="TEST-1", title="Test issue")
+        defaults.update(kwargs)
+        issue = Issue(**defaults)
+        if labels is not None:
+            issue.labels = labels
+        return issue
+
+    def test_workflows_section_parsed(self, tmp_path):
+        """Config with workflows: section creates correct WorkflowConfig objects."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  review-gate:
+    type: gate
+    linear_state: review
+    rework_to: plan
+  implement:
+    type: agent
+    prompt: prompts/impl.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  quick-fix:
+    label: "workflow:quick-fix"
+    path: [plan, implement, done]
+  full-ce:
+    label: "workflow:full-ce"
+    path: [plan, review-gate, implement, done]
+  triage:
+    default: true
+    terminal_state: todo
+    path: [plan, done]
+""")
+        parsed = parse_workflow_file(path)
+        cfg = parsed.config
+
+        assert len(cfg.workflows) == 3
+        assert "quick-fix" in cfg.workflows
+        assert "full-ce" in cfg.workflows
+        assert "triage" in cfg.workflows
+
+        # quick-fix: transitions derived from path
+        qf = cfg.workflows["quick-fix"]
+        assert qf.label == "workflow:quick-fix"
+        assert qf.default is False
+        assert qf.path == ["plan", "implement", "done"]
+        assert qf.transitions["plan"] == {"complete": "implement"}
+        assert qf.transitions["implement"] == {"complete": "done"}
+        assert qf.transitions["done"] == {}
+        assert qf.entry_state == "plan"
+
+        # full-ce: gate derives rework_to from path
+        fc = cfg.workflows["full-ce"]
+        assert fc.transitions["plan"] == {"complete": "review-gate"}
+        assert fc.transitions["review-gate"] == {
+            "approve": "implement",
+            "rework_to": "plan",
+        }
+        assert fc.transitions["implement"] == {"complete": "done"}
+        assert fc.entry_state == "plan"
+
+        # triage: terminal_state override
+        tr = cfg.workflows["triage"]
+        assert tr.default is True
+        assert tr.terminal_state == "todo"
+        assert tr.entry_state == "plan"
+
+    def test_no_workflows_section_synthesizes_default(self, tmp_path):
+        """Config without workflows: creates single _default workflow with StateConfig.transitions."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+    transitions:
+      complete: review
+  review:
+    type: agent
+    prompt: prompts/review.md
+    transitions:
+      complete: done
+      rework: plan
+  done:
+    type: terminal
+    linear_state: terminal
+""")
+        parsed = parse_workflow_file(path)
+        cfg = parsed.config
+
+        assert len(cfg.workflows) == 1
+        assert "_default" in cfg.workflows
+
+        default_wf = cfg.workflows["_default"]
+        assert default_wf.default is True
+        assert default_wf.label is None
+        assert default_wf.path == ["plan", "review", "done"]
+        assert default_wf.terminal_state == "terminal"
+        assert default_wf.entry_state == "plan"
+
+        # Transitions are copied verbatim from StateConfig, NOT derived
+        assert default_wf.transitions["plan"] == {"complete": "review"}
+        assert default_wf.transitions["review"] == {"complete": "done", "rework": "plan"}
+        assert default_wf.transitions["done"] == {}
+
+    def test_resolve_workflow_matches_label(self, tmp_path):
+        """resolve_workflow returns the workflow matching the issue's label."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  quick-fix:
+    label: "workflow:quick-fix"
+    path: [plan, done]
+  triage:
+    default: true
+    path: [plan, done]
+""")
+        cfg = parse_workflow_file(path).config
+        issue = self._make_issue(labels=["workflow:quick-fix", "bug"])
+
+        wf = cfg.resolve_workflow(issue)
+        assert wf.name == "quick-fix"
+
+    def test_resolve_workflow_no_label_match_returns_default(self, tmp_path):
+        """resolve_workflow returns default workflow when no label matches."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  quick-fix:
+    label: "workflow:quick-fix"
+    path: [plan, done]
+  triage:
+    default: true
+    path: [plan, done]
+""")
+        cfg = parse_workflow_file(path).config
+        issue = self._make_issue(labels=["bug", "enhancement"])
+
+        wf = cfg.resolve_workflow(issue)
+        assert wf.name == "triage"
+        assert wf.default is True
+
+    def test_resolve_workflow_case_insensitive(self, tmp_path):
+        """resolve_workflow label matching is case-insensitive."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  quick-fix:
+    label: "Workflow:Quick-Fix"
+    path: [plan, done]
+  triage:
+    default: true
+    path: [plan, done]
+""")
+        cfg = parse_workflow_file(path).config
+
+        # Issue label has different casing
+        issue = self._make_issue(labels=["workflow:quick-fix"])
+        wf = cfg.resolve_workflow(issue)
+        assert wf.name == "quick-fix"
+
+        # Reverse: workflow label is lowercase, issue label uppercase
+        issue2 = self._make_issue(labels=["WORKFLOW:QUICK-FIX"])
+        wf2 = cfg.resolve_workflow(issue2)
+        assert wf2.name == "quick-fix"
+
+    def test_resolve_workflow_no_default_raises(self):
+        """resolve_workflow raises ValueError when no default is configured."""
+        cfg = ServiceConfig(
+            workflows={
+                "no-default": WorkflowConfig(
+                    name="no-default",
+                    label="special",
+                    default=False,
+                    path=["a"],
+                ),
+            }
+        )
+        issue = self._make_issue(labels=["unrelated"])
+        with pytest.raises(ValueError, match="No default workflow"):
+            cfg.resolve_workflow(issue)
+
+    def test_workflow_terminal_state_todo(self, tmp_path):
+        """Workflow with terminal_state: 'todo' is parsed correctly."""
+        path = self._write_yaml(tmp_path, """
+states:
+  classify:
+    type: agent
+    prompt: prompts/classify.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  triage:
+    default: true
+    terminal_state: todo
+    path: [classify, done]
+""")
+        cfg = parse_workflow_file(path).config
+        wf = cfg.workflows["triage"]
+        assert wf.terminal_state == "todo"
+
+    def test_entry_state_delegates_to_default_workflow(self, tmp_path):
+        """ServiceConfig.entry_state delegates to the default workflow's entry_state."""
+        path = self._write_yaml(tmp_path, """
+states:
+  classify:
+    type: agent
+    prompt: prompts/classify.md
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  triage:
+    default: true
+    path: [classify, done]
+  full-ce:
+    label: "workflow:full-ce"
+    path: [plan, done]
+""")
+        cfg = parse_workflow_file(path).config
+        # entry_state should come from the default workflow (triage), not first agent overall
+        assert cfg.entry_state == "classify"
+
+    def test_get_workflow_found(self, tmp_path):
+        """get_workflow returns the workflow by name."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  quick-fix:
+    label: "workflow:quick-fix"
+    path: [plan, done]
+  triage:
+    default: true
+    path: [plan, done]
+""")
+        cfg = parse_workflow_file(path).config
+        wf = cfg.get_workflow("quick-fix")
+        assert wf is not None
+        assert wf.name == "quick-fix"
+
+    def test_get_workflow_not_found(self, tmp_path):
+        """get_workflow returns None for unknown name."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  triage:
+    default: true
+    path: [plan, done]
+""")
+        cfg = parse_workflow_file(path).config
+        assert cfg.get_workflow("nonexistent") is None
+
+    def test_backward_compat_entry_state_no_workflows(self, tmp_path):
+        """ServiceConfig.entry_state works in legacy mode (no workflows: section)."""
+        path = self._write_yaml(tmp_path, """
+states:
+  implement:
+    type: agent
+    prompt: prompts/impl.md
+    transitions:
+      complete: done
+  done:
+    type: terminal
+    linear_state: terminal
+""")
+        cfg = parse_workflow_file(path).config
+        # Should delegate to the synthesized _default workflow
+        assert cfg.entry_state == "implement"
+
+    def test_resolve_workflow_first_label_match_wins(self, tmp_path):
+        """When multiple workflows could match, the first match wins."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  quick-fix:
+    label: "workflow:quick-fix"
+    path: [plan, done]
+  also-quick:
+    label: "bug"
+    path: [plan, done]
+  triage:
+    default: true
+    path: [plan, done]
+""")
+        cfg = parse_workflow_file(path).config
+        # Issue has both labels — first workflow match should win
+        issue = self._make_issue(labels=["workflow:quick-fix", "bug"])
+        wf = cfg.resolve_workflow(issue)
+        assert wf.name == "quick-fix"
+
+    def test_synthesized_default_transitions_preserve_state_config(self, tmp_path):
+        """In legacy mode, synthesized workflow transitions are independent copies."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+    transitions:
+      complete: done
+  done:
+    type: terminal
+    linear_state: terminal
+""")
+        cfg = parse_workflow_file(path).config
+        wf = cfg.workflows["_default"]
+        # Mutating the workflow transitions should not affect StateConfig
+        wf.transitions["plan"]["extra"] = "mutation"
+        assert "extra" not in cfg.states["plan"].transitions
+
+    def test_empty_workflows_section_treated_as_absent(self, tmp_path):
+        """An empty workflows: section is treated like it's absent."""
+        path = self._write_yaml(tmp_path, """
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+    transitions:
+      complete: done
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+""")
+        cfg = parse_workflow_file(path).config
+        assert "_default" in cfg.workflows
+        assert cfg.workflows["_default"].default is True
