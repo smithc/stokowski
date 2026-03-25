@@ -99,10 +99,17 @@ class LoggingConfig:
     max_age_days: int = 14
     max_total_size_mb: int = 500
 
-    def resolved_log_dir(self) -> Path:
-        """Resolve ~ and $VAR in log_dir."""
+    def resolved_log_dir(self, base: Path | None = None) -> Path:
+        """Resolve ~ and $VAR in log_dir.
+
+        Args:
+            base: Base directory for resolving relative paths (e.g. workflow dir).
+        """
         expanded = os.path.expanduser(os.path.expandvars(self.log_dir))
-        return Path(expanded)
+        p = Path(expanded)
+        if not p.is_absolute() and base:
+            p = base / p
+        return p
 
 
 @dataclass

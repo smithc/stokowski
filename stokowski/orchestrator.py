@@ -198,7 +198,7 @@ class Orchestrator:
         if not self.cfg.logging.enabled or not self.cfg.logging.log_dir:
             return
         try:
-            log_dir = self.cfg.logging.resolved_log_dir()
+            log_dir = self.cfg.logging.resolved_log_dir(self.workflow_path.parent)
             if not log_dir.exists():
                 return
 
@@ -1188,7 +1188,7 @@ class Orchestrator:
             # Build log path if logging enabled
             log_path = None
             if self.cfg.logging.enabled and self.cfg.logging.log_dir:
-                log_dir = self.cfg.logging.resolved_log_dir()
+                log_dir = self.cfg.logging.resolved_log_dir(self.workflow_path.parent)
                 issue_log_dir = log_dir / sanitize_key(issue.identifier)
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 ext = ".log" if runner_type == "codex" else ".ndjson"
@@ -1248,7 +1248,7 @@ class Orchestrator:
                     # Recalculate log path per turn in legacy mode
                     turn_log_path = None
                     if self.cfg.logging.enabled and self.cfg.logging.log_dir:
-                        log_dir = self.cfg.logging.resolved_log_dir()
+                        log_dir = self.cfg.logging.resolved_log_dir(self.workflow_path.parent)
                         issue_log_dir = log_dir / sanitize_key(issue.identifier)
                         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                         ext = ".log" if runner_type == "codex" else ".ndjson"
