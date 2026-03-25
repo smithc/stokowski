@@ -205,7 +205,8 @@ async def run_codex_turn(
     stall_timeout_s = stall_timeout_ms / 1000
     turn_timeout_s = turn_timeout_ms / 1000
 
-    # Open log file for raw stdout capture (best-effort)
+    # Open log file for raw stdout capture (best-effort).
+    # Opened after subprocess creation to avoid file handle leak on launch failure.
     log_file = None
     if log_path:
         try:
@@ -404,7 +405,8 @@ async def run_agent_turn(
     stall_timeout_s = claude_cfg.stall_timeout_ms / 1000
     turn_timeout_s = claude_cfg.turn_timeout_ms / 1000
 
-    # Open log file for raw stdout capture (best-effort)
+    # Open log file for raw stdout capture (best-effort).
+    # Opened after subprocess creation to avoid file handle leak on launch failure.
     log_file = None
     if log_path:
         try:

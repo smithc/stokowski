@@ -1529,8 +1529,6 @@ class Orchestrator:
 
 def cleanup_old_logs(log_dir: Path, max_age_days: int) -> int:
     """Delete log files older than max_age_days. Returns count of deleted files."""
-    import time
-
     cutoff = time.time() - (max_age_days * 86400)
     deleted = 0
     for issue_dir in log_dir.iterdir():
@@ -1616,4 +1614,10 @@ def enforce_size_limit(
 
     if deleted:
         logger.info(f"Log retention: deleted {deleted} files to enforce size limit")
+    if total_size > max_bytes:
+        logger.warning(
+            f"Log retention: still over size limit after cleanup "
+            f"({total_size // (1024*1024)}MB > {max_total_size_mb}MB) — "
+            f"remaining files may belong to active agents"
+        )
     return deleted

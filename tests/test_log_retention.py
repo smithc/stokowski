@@ -117,15 +117,12 @@ class TestCleanupOldLogs:
         deleted = cleanup_old_logs(tmp_path, max_age_days=14)
         assert deleted == 0
 
-    def test_nonexistent_directory_does_not_raise(self, tmp_path):
+    def test_nonexistent_directory_raises(self, tmp_path):
         fake_dir = tmp_path / "nonexistent"
-        # cleanup_old_logs iterates log_dir.iterdir() which would raise
-        # but the caller (_cleanup_logs) checks existence first.
-        # The function itself should handle gracefully if called directly.
-        try:
+        # cleanup_old_logs does not guard against missing directories —
+        # the caller (_cleanup_logs) checks existence first.
+        with pytest.raises(FileNotFoundError):
             cleanup_old_logs(fake_dir, max_age_days=14)
-        except FileNotFoundError:
-            pass  # acceptable — caller checks existence
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +180,9 @@ class TestEnforceSizeLimit:
         deleted = enforce_size_limit(
             tmp_path, max_total_size_mb=1, exempt_identifiers={"SMI-1"}
         )
-        assert not active_file.exists() or deleted == 0 or old_file.exists() is False
-        # The exempt file should survive
+        # The exempt file should survive, the non-exempt should be deleted
         assert active_file.exists()
+        assert not old_file.exists()
 
     def test_removes_empty_directories(self, tmp_path):
         issue_dir = tmp_path / "SMI-1"
