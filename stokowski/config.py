@@ -359,6 +359,8 @@ def _resolve_linear_state_name(key: str, ls: LinearStatesConfig) -> str:
         "review": ls.review,
         "gate_approved": ls.gate_approved,
         "rework": ls.rework,
+        "todo": ls.todo,
+        "terminal": ls.terminal[0] if ls.terminal else "Done",
     }
     return mapping.get(key, key)
 

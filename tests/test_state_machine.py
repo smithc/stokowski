@@ -23,6 +23,7 @@ from stokowski.config import (
     WorkflowConfig,
     _coerce_list,
     _parse_state_config,
+    _resolve_linear_state_name,
     derive_workflow_transitions,
     parse_workflow_file,
     validate_config,
@@ -1442,6 +1443,72 @@ class TestWorkflowValidation:
         cfg = self._make_multi_cfg(states, {"wf1": wf1, "wf2": wf2})
         errors = validate_config(cfg)
         assert any("Multiple default workflows" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_linear_state_name (Unit 6)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLinearStateName:
+    """Tests for _resolve_linear_state_name with all logical keys."""
+
+    @staticmethod
+    def _make_ls() -> LinearStatesConfig:
+        return LinearStatesConfig(
+            todo="To Do",
+            active="In Progress",
+            review="Human Review",
+            gate_approved="Gate Approved",
+            rework="Rework",
+            terminal=["Done", "Closed", "Cancelled"],
+        )
+
+    def test_active_resolves(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("active", ls) == "In Progress"
+
+    def test_review_resolves(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("review", ls) == "Human Review"
+
+    def test_gate_approved_resolves(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("gate_approved", ls) == "Gate Approved"
+
+    def test_rework_resolves(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("rework", ls) == "Rework"
+
+    def test_todo_resolves(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("todo", ls) == "To Do"
+
+    def test_terminal_resolves_to_first(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("terminal", ls) == "Done"
+
+    def test_terminal_empty_list_resolves_to_done(self):
+        ls = LinearStatesConfig(terminal=[])
+        assert _resolve_linear_state_name("terminal", ls) == "Done"
+
+    def test_unknown_key_passes_through(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("some_custom_state", ls) == "some_custom_state"
+
+    def test_literal_state_name_passes_through(self):
+        ls = self._make_ls()
+        assert _resolve_linear_state_name("In Progress", ls) == "In Progress"
+
+    def test_custom_terminal_resolves(self):
+        """Verify custom terminal list uses the first entry."""
+        ls = LinearStatesConfig(terminal=["Shipped", "Archived"])
+        assert _resolve_linear_state_name("terminal", ls) == "Shipped"
+
+    def test_custom_todo_resolves(self):
+        """Verify custom todo value is resolved."""
+        ls = LinearStatesConfig(todo="Backlog")
+        assert _resolve_linear_state_name("todo", ls) == "Backlog"
 
 
 # ---------------------------------------------------------------------------

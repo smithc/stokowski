@@ -20,6 +20,7 @@ from .config import (
     StateConfig,
     ParsedConfig,
     WorkflowConfig,
+    _resolve_linear_state_name,
     merge_state_config,
     parse_workflow_file,
     validate_config,
@@ -604,8 +605,10 @@ class Orchestrator:
     async def _transition(self, issue: Issue, transition_name: str):
         """Follow a transition from the current state.
 
+        Uses workflow-specific transitions instead of StateConfig.transitions.
+
         Handles target types:
-        - terminal → move to Done, clean workspace, release tracking
+        - terminal → move to workflow-configured terminal state, clean workspace, release tracking
         - gate → enter gate
         - agent → post state comment, ensure active Linear state, schedule retry
         """
@@ -621,14 +624,18 @@ class Orchestrator:
             self.claimed.discard(issue.id)
             return
 
-        target_name = current_cfg.transitions.get(transition_name)
+        # Resolve workflow-specific transitions for the current state
+        workflow = self._get_issue_workflow_config(issue.id)
+        state_transitions = workflow.transitions.get(current_state_name, {})
+
+        target_name = state_transitions.get(transition_name)
         if not target_name:
             logger.warning(
                 f"No '{transition_name}' transition from state '{current_state_name}' "
                 f"for {issue.identifier}, falling back to 'complete'"
             )
             # Fall back to "complete" — the agent succeeded, don't lose its work
-            target_name = current_cfg.transitions.get("complete")
+            target_name = state_transitions.get("complete")
             if not target_name:
                 self.claimed.discard(issue.id)
                 return
@@ -643,8 +650,9 @@ class Orchestrator:
         run = self._issue_state_runs.get(issue.id, 1)
 
         if target_cfg.type == "terminal":
-            # Move issue to terminal state
-            terminal_state = self.cfg.terminal_linear_states()[0] if self.cfg.terminal_linear_states() else "Done"
+            # Move issue to workflow-configured terminal Linear state
+            terminal_key = workflow.terminal_state  # defaults to "terminal"
+            terminal_state = _resolve_linear_state_name(terminal_key, self.cfg.linear_states)
             try:
                 client = self._ensure_linear_client()
                 moved = await client.update_issue_state(issue.id, terminal_state)
@@ -687,6 +695,7 @@ class Orchestrator:
             comment = make_state_comment(
                 state=target_name,
                 run=run,
+                workflow=workflow.name,
             )
             await client.post_comment(issue.id, comment)
 
