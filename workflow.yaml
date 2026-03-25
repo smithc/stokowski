@@ -1,0 +1,265 @@
+# =============================================================================
+# Stokowski — Multi-Workflow Configuration
+# =============================================================================
+#
+# Shared stage pool with 5 named workflows, selected by Linear labels.
+# Unlabeled issues enter triage (default) which classifies and labels them.
+#
+# Workflows:
+#   triage      (default)              → classify → recycle to Todo with label
+#   refinement  (workflow:refinement)  → refine idea → update ticket
+#   research    (workflow:research)    → research → update ticket
+#   quick-fix   (workflow:quick-fix)   → plan-light → implement → review → merge-review* → merge → done
+#   full-ce     (workflow:full-ce)     → plan → plan-review* → implement ⇄ review
+#                                        → merge-review* → merge → compound → done
+#
+#   * = skippable via labels (yolo, skip-plan-review, skip-mr-review)
+# =============================================================================
+
+tracker:
+  kind: linear
+  project_slug: "<YOUR_LINEAR_PROJECT_SLUG>"  # hex slugId from your Linear project URL
+  api_key: "$LINEAR_API_KEY"
+
+polling:
+  interval_ms: 15000
+
+workspace:
+  root: ~/stokowski-workspaces
+
+hooks:
+  after_create: |
+    git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f'
+    git clone --depth 1 <YOUR_REPO_URL> .
+  timeout_ms: 120000
+
+claude:
+  permission_mode: auto
+  model: claude-opus-4-6
+  max_turns: 500
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
+
+agent:
+  max_concurrent_agents: 10
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:
+    plan: 5
+    implement: 5
+    review: 2
+    merge: 1
+    compound: 2
+    triage: 3
+    refine: 3
+    research: 3
+
+prompts:
+  global_prompt: prompts/global.md
+
+server:
+  port: 4200
+
+logging:
+  enabled: true
+  log_dir: ./logs
+  max_age_days: 14
+  max_total_size_mb: 500
+
+docker:
+  enabled: true
+  default_image: "stokowski/claude-agent:latest"
+  inherit_claude_config: true
+  host_claude_dir: "${HOST_HOME}/.claude"
+  extra_env:
+    - GITHUB_TOKEN
+    - CLAUDE_CODE_OAUTH_TOKEN
+
+linear_states:
+  todo: "Todo"
+  active: "In Progress"
+  review: "Human Review"
+  gate_approved: "Gate Approved"
+  rework: "Rework"
+  terminal:
+    - Done
+    - Cancelled
+
+# =============================================================================
+# Shared Stage Pool
+# =============================================================================
+# Stages are defined once, reused across workflows via path references.
+# Transitions are derived from each workflow's path — do NOT add transitions
+# here (multi-workflow mode errors on state-level transitions).
+# =============================================================================
+
+states:
+  # ── Triage ────────────────────────────────────────────────────────────
+  # Classify incoming issues: read title + description, apply a workflow
+  # label (workflow:quick-fix, workflow:full-ce, etc.), post rationale.
+  triage:
+    type: agent
+    prompt: prompts/triage.md
+    linear_state: active
+    model: claude-sonnet-4-6
+    max_turns: 10
+
+  # ── Refine ────────────────────────────────────────────────────────────
+  # Flesh out an idea: clarify requirements, identify unknowns, update
+  # the ticket with a structured refinement. No code, no MR.
+  refine:
+    type: agent
+    prompt: prompts/refine.md
+    linear_state: active
+    max_turns: 50
+
+  # ── Research ──────────────────────────────────────────────────────────
+  # Product, market, or codebase research. Post findings on the ticket.
+  # No code, no MR.
+  research:
+    type: agent
+    prompt: prompts/research.md
+    linear_state: active
+    max_turns: 50
+
+  # ── Plan (light) ─────────────────────────────────────────────────────
+  # Invoke /ce:plan only — no /deepen-plan. For quick-fix workflows
+  # where a lightweight plan is sufficient.
+  plan-light:
+    type: agent
+    prompt: prompts/plan-light.md
+    linear_state: active
+
+  # ── Plan (deep) ─────────────────────────────────────────────────────
+  # Invoke /ce:plan + /deepen-plan to research codebase and create a
+  # structured, research-grounded implementation plan.
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+    linear_state: active
+
+  # ── Plan Review (gate) ────────────────────────────────────────────────
+  plan-review:
+    type: gate
+    linear_state: review
+    rework_to: plan
+    max_rework: 3
+    skip_labels:
+      - yolo
+      - skip-plan-review
+
+  # ── Implement ─────────────────────────────────────────────────────────
+  # Invoke /ce:work on first run. Rework runs address review feedback
+  # directly, including GitHub PR comments via gh CLI.
+  implement:
+    type: agent
+    prompt: prompts/implement.md
+    linear_state: active
+
+  # ── Review ────────────────────────────────────────────────────────────
+  # Invoke /ce:review for 14+ specialized review agents. Fresh session
+  # for adversarial independence. Safety cap: 3 rework cycles max.
+  review:
+    type: agent
+    prompt: prompts/review.md
+    linear_state: active
+    session: fresh
+    max_rework: 3
+
+  # ── Merge Review (gate) ───────────────────────────────────────────────
+  merge-review:
+    type: gate
+    linear_state: review
+    rework_to: implement
+    max_rework: 5
+    skip_labels:
+      - yolo
+      - skip-mr-review
+
+  # ── Merge ─────────────────────────────────────────────────────────────
+  # Squash-merge the PR. Uses Sonnet for this mechanical task.
+  merge:
+    type: agent
+    prompt: prompts/merge.md
+    linear_state: active
+    model: claude-sonnet-4-6
+    max_turns: 500
+
+  # ── Compound ──────────────────────────────────────────────────────────
+  # Invoke /ce:compound to analyze the cycle and document learnings.
+  # Fresh session for independent retrospective.
+  compound:
+    type: agent
+    prompt: prompts/compound.md
+    linear_state: active
+    session: fresh
+
+  # ── Done ──────────────────────────────────────────────────────────────
+  done:
+    type: terminal
+    linear_state: terminal
+
+# =============================================================================
+# Workflows
+# =============================================================================
+# Each workflow is an ordered path through the shared stage pool.
+# Transitions are derived from path order:
+#   - Agent states: complete → next state in path
+#   - Gate states: approve → next, rework_to → explicit or previous agent
+#   - Terminal: no transitions
+# =============================================================================
+
+workflows:
+  # ── Triage (default) ──────────────────────────────────────────────────
+  # Classifies unlabeled issues and applies a workflow label.
+  # terminal_state: todo recycles the issue back to the pickup state
+  # so it re-enters dispatch with its new label on the next tick.
+  triage:
+    default: true
+    terminal_state: todo
+    path:
+      - triage
+      - done
+
+  # ── Refinement ────────────────────────────────────────────────────────
+  # Simple idea refinement — flesh out requirements, no code produced.
+  refinement:
+    label: "workflow:refinement"
+    path:
+      - refine
+      - done
+
+  # ── Research ──────────────────────────────────────────────────────────
+  # Product, market, or codebase research — findings posted to ticket.
+  research:
+    label: "workflow:research"
+    path:
+      - research
+      - done
+
+  # ── Quick Fix ─────────────────────────────────────────────────────────
+  # Streamlined implementation path: no plan-review gate, but merge-review
+  # gate ensures a human signs off before merge.
+  quick-fix:
+    label: "workflow:quick-fix"
+    path:
+      - plan-light
+      - implement
+      - review
+      - merge-review
+      - merge
+      - done
+
+  # ── Full Compound Engineering ─────────────────────────────────────────
+  # The complete CE pipeline with human gates at plan-review and
+  # merge-review. For complex, high-risk, or multi-stage work.
+  full-ce:
+    label: "workflow:full-ce"
+    path:
+      - plan
+      - plan-review
+      - implement
+      - review
+      - merge-review
+      - merge
+      - compound
+      - done

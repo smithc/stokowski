@@ -12,9 +12,9 @@ WORKFLOW.md
 docs/plans/
 
 # Workflow config (operator-local)
-workflow.yaml
-workflow.yml
-
-# Prompt files (operator-local, examples are tracked)
-prompts/*.md
-!prompts/*.example.md
+# NOTE: On the reference-implementation branch, workflow.yaml and prompts/*.md
+# are tracked as a reference. On other branches, uncomment the lines below:
+# workflow.yaml
+# workflow.yml
+# prompts/*.md
+# !prompts/*.example.md
