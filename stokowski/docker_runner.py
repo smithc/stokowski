@@ -118,12 +118,12 @@ def _prepare_plugin_file(
     dood_mode = bool(shim_host_dir and shim_container_dir)
     if dood_mode:
         if not os.path.isdir(shim_container_dir):
-            logger.error(
-                "plugin_shim_container_path %r is not a directory inside the orchestrator. "
-                "Bind-mount the shim host path into the orchestrator container at this location.",
-                shim_container_dir,
+            raise RuntimeError(
+                f"DooD shim directory {shim_container_dir!r} is missing or not a directory "
+                f"inside the orchestrator container. Bind-mount the host shim path "
+                f"({shim_host_dir!r}) into the orchestrator at this location. "
+                "See CLAUDE.md (Docker mode) for setup."
             )
-            return None
         safe_name = relative_path.replace(os.sep, "__")
         orch_write_path = os.path.join(shim_container_dir, f"stokowski-plugin-{safe_name}")
         host_mount_path = os.path.join(shim_host_dir, f"stokowski-plugin-{safe_name}")
@@ -234,8 +234,15 @@ def build_docker_run_args(
     workspace_key: str,
     env: dict[str, str],
     container_name: str | None = None,
+    needs_plugin_config: bool = False,
 ) -> list[str]:
-    """Build docker run CLI args wrapping an inner command."""
+    """Build docker run CLI args wrapping an inner command.
+
+    ``needs_plugin_config`` opts in to Claude Code plugin config rewriting.
+    Set it to True only for Claude Code agent turns. Codex dispatches and
+    shell hooks leave it at the default — plugin rewriting is skipped
+    entirely, and DooD-mode shim fields are not consulted.
+    """
     args = ["docker", "run", "--rm", "-i"]
 
     if docker_cfg.init:
@@ -267,23 +274,25 @@ def build_docker_run_args(
         args.extend(["-v", f"{host_json}:{home}/.claude.json"])
         # Stage rewritten plugin config files to a host-visible location, then
         # bind-mount them :ro over the originals. This never writes to host_dir.
+        # Only runs for Claude Code dispatches — Codex and hooks skip this.
         # In DooD mode the orchestrator needs an operator-provided shim: a host
         # directory bind-mounted into the orchestrator container (for writing)
         # whose host path is separately known (for passing to agent -v mounts).
         # See docker_runner._prepare_plugin_file for the contract.
-        read_from = resolve_host_path(docker_cfg.host_claude_dir_mount) if docker_cfg.host_claude_dir_mount else ""
-        shim_host = resolve_host_path(docker_cfg.plugin_shim_host_path) if docker_cfg.plugin_shim_host_path else ""
-        shim_container = resolve_host_path(docker_cfg.plugin_shim_container_path) if docker_cfg.plugin_shim_container_path else ""
-        for rel_path in _PLUGIN_FILES_TO_REWRITE:
-            host_mount_path = _prepare_plugin_file(
-                host_dir, home, rel_path,
-                read_from_dir=read_from,
-                shim_host_dir=shim_host,
-                shim_container_dir=shim_container,
-            )
-            if host_mount_path:
-                target = f"{home}/.claude/{rel_path}"
-                args.extend(["-v", f"{host_mount_path}:{target}:ro"])
+        if needs_plugin_config:
+            read_from = resolve_host_path(docker_cfg.host_claude_dir_mount) if docker_cfg.host_claude_dir_mount else ""
+            shim_host = resolve_host_path(docker_cfg.plugin_shim_host_path) if docker_cfg.plugin_shim_host_path else ""
+            shim_container = resolve_host_path(docker_cfg.plugin_shim_container_path) if docker_cfg.plugin_shim_container_path else ""
+            for rel_path in _PLUGIN_FILES_TO_REWRITE:
+                host_mount_path = _prepare_plugin_file(
+                    host_dir, home, rel_path,
+                    read_from_dir=read_from,
+                    shim_host_dir=shim_host,
+                    shim_container_dir=shim_container,
+                )
+                if host_mount_path:
+                    target = f"{home}/.claude/{rel_path}"
+                    args.extend(["-v", f"{host_mount_path}:{target}:ro"])
     else:
         args.extend(["-v", f"{docker_cfg.sessions_volume}:/home/agent/.claude"])
 

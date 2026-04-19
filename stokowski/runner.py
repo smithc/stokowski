@@ -34,11 +34,15 @@ def _prepare_docker_args(
     attempt: RunAttempt,
     env: dict[str, str] | None,
     docker_image: str = "",
+    needs_plugin_config: bool = False,
 ) -> tuple[list[str], str | None, str | None, dict[str, str] | None]:
     """Wrap CLI args in docker run if Docker is enabled.
 
     Returns (args, container_name, cwd, env) -- when Docker is enabled,
     cwd and env are None (handled by docker run args).
+
+    ``needs_plugin_config`` is forwarded to ``build_docker_run_args``. Only
+    ``run_agent_turn`` (Claude Code) should set it to True.
     """
     if not (docker_cfg and docker_cfg.enabled):
         return args, None, str(workspace_path), env
@@ -55,6 +59,7 @@ def _prepare_docker_args(
         workspace_key=workspace_key,
         env=env or {},
         container_name=container_name,
+        needs_plugin_config=needs_plugin_config,
     )
     return docker_args, container_name, None, None
 
@@ -351,9 +356,10 @@ async def run_agent_turn(
         issue_identifier=issue.identifier,
     )
 
-    # Docker wrapping
+    # Docker wrapping — Claude Code needs plugin config rewriting
     args, container_name, sub_cwd, sub_env = _prepare_docker_args(
-        docker_cfg, args, workspace_path, workspace_key, issue, attempt, env, docker_image
+        docker_cfg, args, workspace_path, workspace_key, issue, attempt, env, docker_image,
+        needs_plugin_config=True,
     )
 
     logger.info(
