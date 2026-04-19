@@ -79,6 +79,9 @@ class DockerConfig:
     default_image: str = ""
     inherit_claude_config: bool = True
     host_claude_dir: str = "~/.claude"
+    host_claude_dir_mount: str = ""
+    plugin_shim_host_path: str = ""
+    plugin_shim_container_path: str = ""
     extra_env: list[str] = field(default_factory=list)
     extra_volumes: list[str] = field(default_factory=list)
     volume_prefix: str = "stokowski-ws"
@@ -568,6 +571,9 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         default_image=str(dk.get("default_image", "")),
         inherit_claude_config=bool(dk.get("inherit_claude_config", True)),
         host_claude_dir=str(dk.get("host_claude_dir", "~/.claude")),
+        host_claude_dir_mount=str(dk.get("host_claude_dir_mount", "")),
+        plugin_shim_host_path=str(dk.get("plugin_shim_host_path", "")),
+        plugin_shim_container_path=str(dk.get("plugin_shim_container_path", "")),
         extra_env=_coerce_list(dk.get("extra_env")),
         extra_volumes=_coerce_list(dk.get("extra_volumes")),
         volume_prefix=str(dk.get("volume_prefix", "stokowski-ws")),
@@ -888,6 +894,25 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
                     "agents may fail to authenticate",
                     host_dir,
                 )
+            # In DooD mode (orchestrator inside a container), the orchestrator
+            # cannot write host-visible temp files without an operator-provided
+            # shim. Require explicit shim config to avoid any path where we
+            # might fall back to writing through a bind-mount to host_claude_dir.
+            if os.path.exists("/.dockerenv"):
+                missing = []
+                if not cfg.docker.host_claude_dir_mount:
+                    missing.append("docker.host_claude_dir_mount")
+                if not cfg.docker.plugin_shim_host_path:
+                    missing.append("docker.plugin_shim_host_path")
+                if not cfg.docker.plugin_shim_container_path:
+                    missing.append("docker.plugin_shim_container_path")
+                if missing:
+                    errors.append(
+                        "Docker-in-Docker mode detected with inherit_claude_config: true, "
+                        f"but required shim fields are not set: {', '.join(missing)}. "
+                        "These fields are needed to rewrite plugin paths without touching "
+                        "host files. See CLAUDE.md (Docker mode) for setup."
+                    )
     for name, sc in cfg.states.items():
         if sc.docker_image and not cfg.docker.enabled:
             log.warning(

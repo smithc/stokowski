@@ -8,9 +8,17 @@ services:
       - ./workflow.yaml:/app/workflow.yaml:ro
       - ./prompts:/app/prompts:ro
       - ./logs:/app/logs
+      # Read-only view of the host's .claude dir so the orchestrator can read
+      # plugin config to rewrite container paths. Never written.
+      - ${HOME}/.claude:/host-claude:ro
+      # Read-write shim dir for staging rewritten plugin configs. The host
+      # path is passed to agent docker runs for :ro bind-mounts. Must exist.
+      - ${HOME}/.stokowski-plugin-shim:/plugin-shim
     env_file: .env
     environment:
       - HOST_HOME=${HOME}
+      # Passed through to workflow.yaml; keeps paths in one place.
+      - HOST_PLUGIN_SHIM=${HOME}/.stokowski-plugin-shim
     ports:
       - "${STOKOWSKI_PORT:-4200}:4200"
     command: ["workflow.yaml", "--port", "4200"]

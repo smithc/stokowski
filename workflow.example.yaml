@@ -117,6 +117,13 @@ server:
 #   default_image: "stokowski/claude-agent:latest"
 #   inherit_claude_config: true
 #   host_claude_dir: "${HOST_HOME}/.claude"
+#   # DooD shim fields — required when the orchestrator itself runs in a
+#   # container AND inherit_claude_config is true. Stokowski refuses to start
+#   # in DooD mode without these to prevent host plugin files from being
+#   # rewritten. See CLAUDE.md (Docker mode) for setup.
+#   host_claude_dir_mount: "/host-claude"           # where host_claude_dir is RO-mounted inside the orchestrator
+#   plugin_shim_host_path: "${HOST_PLUGIN_SHIM}"    # host-resolvable shim dir (e.g. ${HOME}/.stokowski-plugin-shim)
+#   plugin_shim_container_path: "/plugin-shim"      # where plugin_shim_host_path is RW-mounted inside the orchestrator
 #   extra_env:
 #     - GITHUB_TOKEN
 #     - CLAUDE_CODE_OAUTH_TOKEN    # required for Claude Code auth in containers

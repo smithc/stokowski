@@ -35,80 +35,123 @@ def resolve_host_path(path: str) -> str:
     return expanded
 
 
-_plugin_file_cache: dict[tuple[str, str, str], tuple[str, float]] = {}
-"""Cache of (host_dir, container_home, relative_path) → (temp_file_path, mtime).
-Avoids creating a new temp file per container launch. Invalidated when source mtime changes."""
+_plugin_file_cache: dict[tuple[str, str, str], tuple[str, str, float]] = {}
+"""Cache of (host_dir, container_home, relative_path) → (host_mount_path, orch_write_path, mtime).
 
-# Plugin config files that need host→container path rewriting.
-# Claude Code discovers plugins primarily through known_marketplaces.json
-# (installLocation fields), with installed_plugins.json as secondary metadata.
+host_mount_path is passed to ``docker run -v`` (must resolve on the host Docker daemon).
+orch_write_path is where the orchestrator process writes the file (same filesystem as host_mount_path,
+but named via the orchestrator's view of it in DooD). The two paths are identical in non-DooD.
+Invalidated when source mtime changes.
+"""
+
 _PLUGIN_FILES_TO_REWRITE = (
     os.path.join("plugins", "installed_plugins.json"),
     os.path.join("plugins", "known_marketplaces.json"),
 )
 
 
+def _is_dood() -> bool:
+    """Detect whether the orchestrator process is running inside a container."""
+    return os.path.exists("/.dockerenv")
+
+
 def _prepare_plugin_file(
-    host_claude_dir: str, container_home: str, relative_path: str
+    host_claude_dir: str,
+    container_home: str,
+    relative_path: str,
+    *,
+    read_from_dir: str = "",
+    shim_host_dir: str = "",
+    shim_container_dir: str = "",
 ) -> str | None:
-    """Create a temp copy of a plugin config file with paths rewritten for the container.
+    """Stage a rewritten plugin config file and return its host path for bind-mounting.
 
-    Reads the host file at ``{host_claude_dir}/{relative_path}``, replaces all
-    occurrences of ``host_claude_dir`` with the container equivalent, writes a
-    ``0644`` temp file, and returns its path for bind-mounting into the container.
+    The orchestrator reads the operator's plugin config (from ``read_from_dir`` in DooD,
+    or directly from ``host_claude_dir`` in non-DooD), rewrites absolute path references
+    from the host's ``.claude`` location to the agent container's, and writes the result
+    to a host-visible location. The returned path is what the host Docker daemon will
+    resolve when passed to ``docker run -v <path>:<target>:ro``.
 
-    Returns ``None`` if the source file doesn't exist or isn't readable (e.g. in
-    DooD mode where host paths aren't accessible from the orchestrator container).
-    Results are cached per ``(host_claude_dir, container_home, relative_path)``
-    and invalidated when the source file's mtime changes.
+    This function never writes to the operator's ``.claude`` directory. In DooD mode
+    without a configured shim, it returns None — callers must treat that as a
+    configuration error rather than silently proceed.
+
+    Args:
+        host_claude_dir: Host-resolvable path of the operator's ``.claude`` dir.
+            Used for path-rewriting substitution and as a cache key component.
+        container_home: Agent container's HOME (e.g. ``/home/agent``).
+        relative_path: Path under ``.claude/`` to the plugin config file.
+        read_from_dir: Orchestrator-visible path to the operator's ``.claude`` dir.
+            Required in DooD; ignored (defaults to host_claude_dir) otherwise.
+        shim_host_dir: Host-resolvable path of the shim directory for agent ``-v``
+            mounts. Required in DooD; when empty, uses a host tempfile.
+        shim_container_dir: Orchestrator-visible path of the same shim directory.
+            Required in DooD; when empty, uses a host tempfile.
     """
-    host_file = os.path.join(host_claude_dir, relative_path)
-    if not os.path.isfile(host_file):
+    read_dir = read_from_dir or host_claude_dir
+    read_file = os.path.join(read_dir, relative_path)
+    if not os.path.isfile(read_file):
         return None
 
     cache_key = (host_claude_dir, container_home, relative_path)
     try:
-        current_mtime = os.path.getmtime(host_file)
+        current_mtime = os.path.getmtime(read_file)
     except OSError:
         current_mtime = 0.0
 
-    # Return cached temp file if source hasn't changed
     cached = _plugin_file_cache.get(cache_key)
     if cached:
-        cached_path, cached_mtime = cached
-        if current_mtime == cached_mtime and os.path.isfile(cached_path):
-            return cached_path
+        cached_host_path, cached_orch_path, cached_mtime = cached
+        if current_mtime == cached_mtime and os.path.isfile(cached_orch_path):
+            return cached_host_path
 
     try:
-        with open(host_file, "r") as f:
+        with open(read_file, "r") as f:
             content = f.read()
     except PermissionError:
-        logger.warning("Cannot read %s — skipping path rewrite for container", host_file)
+        logger.warning("Cannot read %s — skipping path rewrite for container", read_file)
         return None
 
-    # Rewrite host paths to container paths
     container_claude_dir = f"{container_home}/.claude"
     rewritten = content.replace(host_claude_dir, container_claude_dir)
 
-    # Write to a temp file that persists until the source changes or process exits
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", prefix="stokowski-plugin-", suffix=".json", delete=False
-    )
-    tmp.write(rewritten)
-    tmp.close()
-    os.chmod(tmp.name, 0o644)  # Ensure container agent user can read it
+    dood_mode = bool(shim_host_dir and shim_container_dir)
+    if dood_mode:
+        if not os.path.isdir(shim_container_dir):
+            logger.error(
+                "plugin_shim_container_path %r is not a directory inside the orchestrator. "
+                "Bind-mount the shim host path into the orchestrator container at this location.",
+                shim_container_dir,
+            )
+            return None
+        safe_name = relative_path.replace(os.sep, "__")
+        orch_write_path = os.path.join(shim_container_dir, f"stokowski-plugin-{safe_name}")
+        host_mount_path = os.path.join(shim_host_dir, f"stokowski-plugin-{safe_name}")
+        with open(orch_write_path, "w") as f:
+            f.write(rewritten)
+        os.chmod(orch_write_path, 0o644)
+    else:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", prefix="stokowski-plugin-", suffix=".json", delete=False
+        )
+        tmp.write(rewritten)
+        tmp.close()
+        os.chmod(tmp.name, 0o644)
+        orch_write_path = tmp.name
+        host_mount_path = tmp.name
 
-    # Clean up previous temp file if any
-    if cached:
-        old_path = cached[0]
-        if old_path != tmp.name:
+    # Clean up the prior cached temp (non-DooD only — DooD uses deterministic names
+    # that overwrite in place).
+    if cached and not dood_mode:
+        old_orch_path = cached[1]
+        if old_orch_path != orch_write_path:
             try:
-                os.unlink(old_path)
+                os.unlink(old_orch_path)
             except OSError:
                 pass
 
-    _plugin_file_cache[cache_key] = (tmp.name, current_mtime)
-    return tmp.name
+    _plugin_file_cache[cache_key] = (host_mount_path, orch_write_path, current_mtime)
+    return host_mount_path
 
 
 def workspace_volume_name(docker_cfg: DockerConfig, workspace_key: str) -> str:
@@ -211,7 +254,6 @@ def build_docker_run_args(
     args.extend(["-v", f"{vol}:/workspace", "-w", "/workspace"])
 
     # Claude config — either inherit from host or use sessions volume
-    plugins_prepared = False
     if docker_cfg.inherit_claude_config:
         # Read-write mount: agents can write session data for --resume support.
         # This means agents can also modify host Claude config — accepted tradeoff
@@ -223,23 +265,25 @@ def build_docker_run_args(
         # Claude Code also reads ~/.claude.json for its main config
         host_json = os.path.join(os.path.dirname(host_dir), ".claude.json")
         args.extend(["-v", f"{host_json}:{home}/.claude.json"])
-        # Pass host claude dir so entrypoint can rewrite plugin paths
-        args.extend(["-e", f"STOKOWSKI_HOST_CLAUDE_DIR={host_dir}"])
-        # Prepare rewritten, readable copies of plugin config files.
-        # These files are often mode 0600 (owner-only) which the container's
-        # non-root agent user cannot read, and they contain host-absolute paths
-        # that don't resolve inside the container. _prepare_plugin_file() reads
-        # each file host-side, rewrites paths, writes a 0644 temp copy, and we
-        # bind-mount it read-only over the original.
-        # In DooD mode (orchestrator in a container), host paths aren't
-        # accessible — _prepare_plugin_file returns None and we fall back to
-        # an in-container fixup below.
+        # Stage rewritten plugin config files to a host-visible location, then
+        # bind-mount them :ro over the originals. This never writes to host_dir.
+        # In DooD mode the orchestrator needs an operator-provided shim: a host
+        # directory bind-mounted into the orchestrator container (for writing)
+        # whose host path is separately known (for passing to agent -v mounts).
+        # See docker_runner._prepare_plugin_file for the contract.
+        read_from = resolve_host_path(docker_cfg.host_claude_dir_mount) if docker_cfg.host_claude_dir_mount else ""
+        shim_host = resolve_host_path(docker_cfg.plugin_shim_host_path) if docker_cfg.plugin_shim_host_path else ""
+        shim_container = resolve_host_path(docker_cfg.plugin_shim_container_path) if docker_cfg.plugin_shim_container_path else ""
         for rel_path in _PLUGIN_FILES_TO_REWRITE:
-            tmp = _prepare_plugin_file(host_dir, home, rel_path)
-            if tmp:
+            host_mount_path = _prepare_plugin_file(
+                host_dir, home, rel_path,
+                read_from_dir=read_from,
+                shim_host_dir=shim_host,
+                shim_container_dir=shim_container,
+            )
+            if host_mount_path:
                 target = f"{home}/.claude/{rel_path}"
-                args.extend(["-v", f"{tmp}:{target}:ro"])
-                plugins_prepared = True
+                args.extend(["-v", f"{host_mount_path}:{target}:ro"])
     else:
         args.extend(["-v", f"{docker_cfg.sessions_volume}:/home/agent/.claude"])
 
@@ -259,46 +303,12 @@ def build_docker_run_args(
     # Image
     args.append(image)
 
-    # Plugin path rewriting: prefer host-side (temp files mounted over originals).
-    # In DooD mode the orchestrator can't read host files, so fall back to an
-    # in-container fixup that COPIES each file to /tmp before rewriting — never
-    # destructively modifying the host's originals via the bind mount.
-    if docker_cfg.inherit_claude_config and not plugins_prepared:
-        escaped_cmd = " ".join(_shell_escape(c) for c in command)
-        # For each plugin config file: copy to /tmp, rewrite host paths to
-        # container paths, copy back. On Docker Desktop for Mac/Windows,
-        # bind-mounted files appear as owned by the container user so cp works.
-        # Also fix marketplaces/ directory permissions for Linux Docker where
-        # UID mapping doesn't apply and 0700 blocks the agent user.
-        fixup_script = (
-            '_rewrite() { '
-            'SRC="$HOME/.claude/$1"; TMP="/tmp/stokowski-$(basename $1)"; '
-            'if [ -f "$SRC" ]; then '
-            'cp "$SRC" "$TMP" 2>/dev/null && '
-            'sed -i "s|$STOKOWSKI_HOST_CLAUDE_DIR|$HOME/.claude|g" "$TMP" && '
-            'cp "$TMP" "$SRC" 2>/dev/null; fi; }; '
-            'if [ -n "$STOKOWSKI_HOST_CLAUDE_DIR" ]; then '
-            '_rewrite plugins/installed_plugins.json; '
-            '_rewrite plugins/known_marketplaces.json; '
-            'chmod a+rx "$HOME/.claude/plugins/marketplaces" 2>/dev/null; '
-            "fi; "
-            f"exec {escaped_cmd}"
-        )
-        args.extend(["bash", "-c", fixup_script])
-    else:
-        args.extend(command)
+    # Command runs directly. Plugin path rewriting is handled entirely host-side
+    # via the :ro overlay mounts above — the agent container never rewrites
+    # anything at runtime.
+    args.extend(command)
 
     return args
-
-
-def _shell_escape(s: str) -> str:
-    """Escape a string for safe inclusion in a shell command."""
-    if not s:
-        return "''"
-    import re as _re
-    if _re.match(r"^[A-Za-z0-9_./:=@-]+$", s):
-        return s
-    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def container_name_for(
