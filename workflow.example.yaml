@@ -63,11 +63,16 @@ linear_states:
     - Duplicate
   # Reserved states for scheduled-job template issues. Templates live in
   # these states (outside the normal dispatch pool) — children materialize
-  # into the usual active/review/terminal flow.
+  # into the usual active/review/terminal flow. All four must be set when
+  # any `schedules:` entry exists.
   schedule_scheduled: "Scheduled"     # template is active; fires on its cron
   schedule_paused: "Paused"           # template is paused; evaluator skips
   schedule_trigger_now: "Trigger Now" # operator-requested out-of-band fire
   schedule_error: "Error"             # template hit permanent failure; needs attention
+  # Dedicated cancel sink — required when any schedule uses
+  # overlap_policy: cancel_previous. Stokowski moves superseded in-flight
+  # children here so they don't get confused with human-initiated cancels.
+  canceled: "Canceled"
 
 # ---------------------------------------------------------------------------
 # Polling
@@ -277,28 +282,73 @@ states:
 # cron-driven Linear "template" issue to one of the workflows above.
 #
 # Operators create a template issue in Linear, label it `schedule:<name>`,
-# set the cron expression + timezone via Linear custom fields, and move it
-# to the Scheduled state. On each cron fire, Stokowski materialises a
-# child sub-issue that flows through the referenced workflow normally.
+# set the cron expression + timezone via Linear custom fields (or YAML
+# front-matter in the issue description), and move it to the Scheduled
+# state. On each cron fire, Stokowski materialises a child sub-issue that
+# flows through the referenced workflow normally.
 #
-# Fields:
-#   workflow        — name of an entry in `workflows:` (required)
-#   overlap_policy  — skip | queue | cancel_previous | parallel
-#   workspace_mode  — ephemeral | persistent
-#   on_missed       — skip | run_once | run_all
-#   run_all_cap     — max missed fires to catch up when on_missed=run_all
-#   retention_days  — days before terminal children are archived
-#   max_runtime_ms  — kill a child that exceeds this wall-clock budget
-#   timezone        — default IANA timezone if the template doesn't set one
+# See CLAUDE.md ("Scheduled jobs") for the full operator protocol:
+# watermarks, Trigger-Now, Pause, workspace-mode semantics, and the
+# single-writer-per-tenant deployment constraint.
 #
-# Uncomment and adapt for your own schedules:
-#
-# schedules:
-#   compound-refresh:
-#     workflow: full-ce
-#     overlap_policy: skip
-#     workspace_mode: ephemeral
-#     on_missed: skip
-#     retention_days: 30
-#     timezone: "America/New_York"
-schedules: {}
+schedules:
+
+  # Canonical example: run a "compound refresh" pass on a recurring cadence.
+  # The template issue in Linear carries the `schedule:compound-refresh`
+  # label plus a Cron custom field (e.g. "0 6 * * MON" — 6am every Monday).
+  compound-refresh:
+    # Which workflow to run when this schedule fires. Must match a key
+    # defined above (in legacy single-workflow mode this is always
+    # `_default`). In multi-workflow mode, this must be an entry in the
+    # `workflows:` block. Scheduled children only reach labelled workflows
+    # via default routing — if you want a scheduled child to hit a
+    # non-default workflow, give that workflow a label and have the
+    # template prompt your agent to apply it.
+    workflow: _default
+
+    # What to do when a prior child of this template is still in-flight at
+    # cron-fire time.
+    #   skip             — default, safest. Drop the new fire.
+    #   queue            — hold the fire in a queue; dispatch when the
+    #                      previous child reaches terminal.
+    #   cancel_previous  — move the in-flight child to the `canceled`
+    #                      Linear state and dispatch the new one. Requires
+    #                      `linear_states.canceled` to be set (see above).
+    #   parallel         — allow multiple concurrent children. Only safe
+    #                      when children are fully independent.
+    overlap_policy: skip
+
+    # Workspace lifecycle per firing:
+    #   ephemeral  — each child gets a fresh clone; deleted on terminal.
+    #                Right for most cases (deterministic, isolated).
+    #   persistent — children share a workspace directory across fires
+    #                (keyed by template). Useful for schedules that rely
+    #                on long-lived local state (caches, indexes). Changing
+    #                this on a live schedule requires an operator-visible
+    #                ack file — see CLAUDE.md pitfalls.
+    workspace_mode: ephemeral
+
+    # Catch-up policy when Stokowski was offline across one or more cron
+    # fires (e.g. a deploy gap).
+    #   skip      — default. Ignore missed fires; resume on the next slot.
+    #   run_once  — fire exactly once to cover the gap.
+    #   run_all   — fire once per missed slot up to `run_all_cap`.
+    on_missed: skip
+
+    # Upper bound on catch-up fires when on_missed: run_all. Slots beyond
+    # the cap produce a single `bounded_drop` ledger comment on the
+    # template plus terminal `skipped_bounded` watermarks per slot.
+    run_all_cap: 5
+
+    # Days before completed child sub-issues of this template auto-archive.
+    # Must be >= 1. Archived children remain queryable in Linear but are
+    # filtered out of Stokowski's active-state fetches.
+    retention_days: 30
+
+    # Optional wall-clock budget (milliseconds). A child exceeding this is
+    # hard-killed and marked failed. Omit (or set null) for no cap.
+    # max_runtime_ms: 7200000   # 2 hours
+
+    # IANA timezone for this schedule type. Used only when the template
+    # does not declare its own timezone. Must resolve via `zoneinfo`.
+    timezone: "America/New_York"

@@ -88,6 +88,35 @@ Each workflow defines a set of internal states that map to Linear states. States
 
 **Structured comment tracking:** State transitions and gate decisions are persisted as HTML comments on Linear issues (`<!-- stokowski:state {...} -->` and `<!-- stokowski:gate {...} -->`). These enable crash recovery and provide context for rework runs.
 
+### Scheduled jobs
+Stokowski can run recurring autonomous work on a cron cadence by pairing **schedule types** (declared in `workflow.yaml`) with **template issues** (live in Linear). Each template fire materializes a fresh child sub-issue that flows through a referenced workflow using the normal agent → gate → terminal pipeline.
+
+**Two-level model:**
+1. A `schedules:` block in `workflow.yaml` declares *schedule types* — named policy sets that bind a workflow to an overlap policy, workspace mode, missed-fire policy, retention window, and timezone. See `workflow.example.yaml` for every field.
+2. Operators create one or more **template issues** in Linear, label each with `schedule:<type-name>`, and set the cron expression on the template (Linear custom field or YAML front-matter in the description). A template is not a runnable issue — it lives in a reserved `Scheduled` state and is invisible to the normal dispatch pool.
+
+**Reserved Linear states:** Templates occupy four dedicated states configured under `linear_states`: `schedule_scheduled` ("Scheduled"), `schedule_paused` ("Paused"), `schedule_trigger_now` ("Trigger Now"), `schedule_error` ("Error"). An additional `canceled` state is required when any schedule uses `overlap_policy: cancel_previous`. All five must exist in Linear before any schedule can fire.
+
+**Watermark protocol:** Each fire (and each intentional skip) is recorded as a structured `<!-- stokowski:watermark {...} -->` comment on the template itself. Watermarks form an append-only ledger keyed by `(template_id, slot)` where `slot` is the cron-resolved ISO timestamp for the firing (or `trigger:<wall-clock>` for Trigger-Now fires). The ledger is the idempotency backbone: on restart the orchestrator re-reads watermarks rather than re-firing from wall clock. Watermarks within a single millisecond are tiebroken by a `seq` counter owned by the orchestrator — any parser that ignores `seq` will mis-order concurrent watermarks.
+
+**Operator workflow:**
+1. Add a schedule type to `workflow.yaml` under `schedules:` (workflow, overlap_policy, workspace_mode, on_missed, retention_days, timezone).
+2. Ensure the reserved Linear states exist; set `linear_states.schedule_*` (and `canceled` if you use `cancel_previous`).
+3. Deploy Stokowski. Configuration is re-read each poll tick — no restart required.
+4. In Linear, create a template issue, apply the `schedule:<name>` label, set the Cron custom field, and move it to the `Scheduled` state.
+5. On each cron slot, Stokowski materializes a child sub-issue, copies prompt/description context, and dispatches it normally. The template itself never dispatches.
+
+**Pause / Trigger-Now / Kill mechanics:** Operators control scheduled templates by changing the template's Linear state.
+- **Pause:** move the template to `Paused`. The evaluator skips cron slots while paused; no catch-up on unpause unless `on_missed: run_all`.
+- **Trigger-Now:** move to `Trigger Now`. Stokowski fires a one-off with slot `trigger:<iso>` (a distinct namespace from cron slots — skip overlap does not suppress it) and returns the template to `Scheduled`.
+- **Kill:** move the template to a terminal state. All in-flight children are canceled and the template is retired. Hard-delete also cascades — `_reconcile()` tolerates missing templates with a 3-tick threshold before cleanup.
+
+**Workspace modes:**
+- `ephemeral` (default) — each child gets a fresh clone; deleted when the child reaches terminal. Deterministic and isolated.
+- `persistent` — children of the same template share a workspace directory across fires (keyed by template). Useful for schedules relying on long-lived local state (caches, indexes). Switching `workspace_mode` on a live schedule type is a breaking change and requires an operator-supplied ack marker (see pitfalls).
+
+**Single-writer-per-tenant deployment constraint:** The watermark ledger assumes exactly one orchestrator is evaluating a given template at a time. Running two orchestrator replicas against the same Linear project will double-fire schedules. For Fargate / ECS deployments, pin each tenant to a task definition with `desiredCount: 1` and `minimumHealthyPercent: 0` (no rolling-restart overlap). Horizontal scale is per-tenant, not per-orchestrator.
+
 ### Workspace isolation
 Each issue gets its own directory under `workspace.root`. Agents run with `cwd` set to that directory. Workspaces persist across turns for the same session; they're deleted when the issue reaches a terminal state. The workspace path is `{workspace.root}/{issue_identifier}-{repo_name}` — legacy 1:1 configs synthesize `repo_name="_default"` and get paths like `{root}/SMI-14-_default`.
 
@@ -311,7 +340,24 @@ stokowski -v
 stokowski --port 4200
 ```
 
-An automated test suite lives in `tests/` covering config parsing/validation, workspace key composition, cancel semantics, docker_runner, log retention, state machine routing, multi-repo routing, rejection handling, cold-start recovery, and prompt assembly. Run with `pytest tests/`. End-to-end flow is still best verified by running against a real Linear project with a test ticket.
+An automated test suite lives in `tests/` covering config parsing/validation, workspace key composition, cancel semantics, docker_runner, log retention, state machine routing, multi-repo routing, rejection handling, cold-start recovery, prompt assembly, scheduler evaluation, and workspace-mode refusal. Convention: pure-function tests — no mocks, no network, no Linear/Docker. Logic that needs external state is refactored into a pure function taking snapshots so it can be tested directly (see `stokowski/scheduler.py` `evaluate_template` and `stokowski/orchestrator.py` `cleanup_old_logs` / `enforce_size_limit` for the established pattern).
+
+### Running tests
+
+Install dev dependencies and run pytest:
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+Opt-in Linear sandbox integration tests require a sandbox API key — without it, pytest collects and skips them:
+
+```bash
+LINEAR_API_KEY_SANDBOX=... pytest tests/test_linear_sandbox_integration.py
+```
+
+Beyond the unit tests, the system is best verified end-to-end by running against a real Linear project with a test ticket.
 
 ---
 
@@ -352,6 +398,9 @@ An automated test suite lives in `tests/` covering config parsing/validation, wo
 - **`_cleanup_issue_state()` must stay in sync with `__init__`**: Any new per-issue tracking dict added to `Orchestrator.__init__` must also be added to `_cleanup_issue_state()`. Failure to do so causes memory leaks and stale state on cancellation.
 - **Multi-project: every per-issue `self.cfg` read must route via `_cfg_for_issue(issue_id)`**: Reading `self.cfg` directly in a post-dispatch path silently falls back to the primary project's cfg — project B's ticket would resolve against project A's workflows, repos, or state names. The transitional `self.cfg` property exists only as a back-compat shim during the Unit 5 sweep; new code should use `self._cfg_for_issue_or_primary(issue.id)` (falls back to primary when `_issue_project` has no binding yet) or `self._primary_cfg()` for shared-globals reads.
 - **Multi-project: `_issue_project` must be stamped before any `_cfg_for_issue` call for gate issues**: Gate states (review / gate_approved / rework) are not in `active_linear_states()` so they're never returned by `_tick`'s candidate fetch. `_handle_gate_responses` is the sole binding site for gate issues after orchestrator restart — it iterates projects, stamps `_issue_project` before fetching comments, then runs the existing per-issue logic.
+- **`_cleanup_template_state()` must stay in sync with `__init__`**: The schedule subsystem has its own symmetry requirement. Any new `_template_*` dict added to `Orchestrator.__init__` must also be added to `_cleanup_template_state()` — otherwise a hard-delete cascade (template archived or deleted from Linear) leaks template-side tracking entries. This is separate from `_cleanup_issue_state()`; templates are not child issues.
+- **Watermark `seq` field**: Watermarks within a single millisecond are tiebroken by a monotonic `seq` counter. The orchestrator owns that counter (`_template_watermark_seq`) and seeds it lazily per-template from the highest existing `seq` on first sight. When writing or reading watermark comments, never drop `seq` — ordering by timestamp alone will mis-order co-ms fires. This matters for `parallel` overlap policy and Trigger-Now fires that race a cron slot.
+- **Workspace-mode change requires operator marker file**: Changing `workspace_mode` on a live schedule type that already has templates is a breaking change — persistent workspaces may contain child-specific state that ephemeral mode will delete, and vice versa. `_load_all_workflows` refuses the change by default for the primary project (scheduled-jobs are v1 single-project scope), logging the change-hash. To confirm, the operator must create `.schedule-workspace-reset-ack` next to the primary workflow file containing that hash. The marker is consumed (deleted) on successful reload so it cannot silently re-authorize a future change.
 - **Agent run logs**: When `logging.enabled` is true, raw agent stdout is captured to `{log_dir}/{issue_identifier}/` as `.ndjson` (Claude Code) or `.log` (Codex) files. To debug an agent run: `cat {log_dir}/SMI-14/20260324T041500Z-turn-1.ndjson | jq .` Logs survive workspace cleanup — their lifetime is controlled by `max_age_days` and `max_total_size_mb`. Retention cleanup runs at startup and after each worker exit. Log writes are best-effort — failures do not affect agent execution.
 - **Multi-repo: hook Jinja rendering is gated on `cfg.repos_synthesized`**: When `repos:` section is absent (synthesized=True), root hooks bypass Jinja entirely and pass through to the shell verbatim. This is deliberate — legacy configs may contain literal `{`/`}` shell syntax (credential helpers with `!f() { ...; }; f`). When the operator adds an explicit `repos:` section, Jinja rendering activates with `StrictUndefined` over the `repo` namespace. Typos (e.g. `{{ repo.clne_url }}`) raise `UndefinedError` and post a user-facing Linear comment with retry-cap = 1. Do NOT switch rendering to `_SilentUndefined` for hooks — `git clone $EMPTY` from a silent substitution is catastrophic.
 - **Multi-repo: `_default` repo name is reserved**: Operator-authored `repos:` entries must not use the name `_default`. R21 validation rejects configs that try. The synthesis branch uses `_default` with `label=None`/`clone_url=""` as its sentinel shape, and `_repos_synthesized` distinguishes synthesis from operator authorship.
