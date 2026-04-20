@@ -406,3 +406,9 @@ Beyond the unit tests, the system is best verified end-to-end by running against
 - **Multi-repo: `_default` repo name is reserved**: Operator-authored `repos:` entries must not use the name `_default`. R21 validation rejects configs that try. The synthesis branch uses `_default` with `label=None`/`clone_url=""` as its sentinel shape, and `_repos_synthesized` distinguishes synthesis from operator authorship.
 - **Multi-repo: R10 rejection is posted by an async pre-pass, not `_is_eligible`**: `_is_eligible` stays synchronous and only reads `_rejected_issues`. The async work (comment fetch + dedup + post) happens in `_process_rejections` before the sync eligibility loop runs in `_tick`. Any future eligibility rule requiring Linear I/O should follow the same pre-pass pattern rather than making `_is_eligible` async.
 - **Multi-repo: tracking comments `repo` field uses defensive read**: `parse_latest_tracking` applies `setdefault("repo", None)`. Readers MUST use `tracking.get("repo") or fallback` — never `tracking["repo"]`. Pre-multi-repo comments don't carry the field; cold-start recovery relies on the fallback and posts a one-time migration notice.
+
+---
+
+## Documented Solutions
+
+`docs/solutions/` — documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`, `component`). Relevant when implementing or debugging in documented areas. Populated by the `/ce-compound` workflow.
