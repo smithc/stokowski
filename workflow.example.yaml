@@ -309,13 +309,13 @@ schedules:
     # What to do when a prior child of this template is still in-flight at
     # cron-fire time.
     #   skip             — default, safest. Drop the new fire.
-    #   queue            — hold the fire in a queue; dispatch when the
-    #                      previous child reaches terminal.
     #   cancel_previous  — move the in-flight child to the `canceled`
     #                      Linear state and dispatch the new one. Requires
     #                      `linear_states.canceled` to be set (see above).
     #   parallel         — allow multiple concurrent children. Only safe
     #                      when children are fully independent.
+    # Note: `queue` is reserved for a future release and is rejected at
+    # startup. Use one of the three policies above instead.
     overlap_policy: skip
 
     # Workspace lifecycle per firing:

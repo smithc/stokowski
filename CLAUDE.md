@@ -340,7 +340,7 @@ stokowski -v
 stokowski --port 4200
 ```
 
-An automated test suite lives in `tests/` covering config parsing/validation, workspace key composition, cancel semantics, docker_runner, log retention, state machine routing, multi-repo routing, rejection handling, cold-start recovery, prompt assembly, scheduler evaluation, and workspace-mode refusal. Convention: pure-function tests — no mocks, no network, no Linear/Docker. Logic that needs external state is refactored into a pure function taking snapshots so it can be tested directly (see `stokowski/scheduler.py` `evaluate_template` and `stokowski/orchestrator.py` `cleanup_old_logs` / `enforce_size_limit` for the established pattern).
+The test suite is comprehensive (~470 tests across ~16 test files in `tests/`), covering config parsing/validation, workspace key composition, cancel semantics, docker_runner, log retention, state machine routing, multi-repo routing, rejection handling, cold-start recovery, prompt assembly, scheduler evaluation, and workspace-mode refusal. Convention: pure-function tests — no mocks, no network, no Linear/Docker. Logic that needs external state is refactored into a pure function taking snapshots so it can be tested directly (see `stokowski/scheduler.py` `evaluate_template` and `stokowski/orchestrator.py` `cleanup_old_logs` / `enforce_size_limit` for the established pattern).
 
 ### Running tests
 
@@ -351,10 +351,10 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Opt-in Linear sandbox integration tests require a sandbox API key — without it, pytest collects and skips them:
+Opt-in Linear sandbox integration tests require a sandbox API key and team ID — without both, pytest collects and skips them:
 
 ```bash
-LINEAR_API_KEY_SANDBOX=... pytest tests/test_linear_sandbox_integration.py
+LINEAR_API_KEY_SANDBOX=... LINEAR_TEAM_ID_SANDBOX=... pytest tests/test_linear_sandbox_integration.py
 ```
 
 Beyond the unit tests, the system is best verified end-to-end by running against a real Linear project with a test ticket.

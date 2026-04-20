@@ -11,7 +11,10 @@ import signal
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from .config import ScheduleConfig
 
 from jinja2 import (
     Environment,
@@ -246,8 +249,8 @@ def compute_workspace_mode_change_hash(
 
 
 def detect_workspace_mode_changes(
-    old_schedules: dict[str, Any],
-    new_schedules: dict[str, Any],
+    old_schedules: dict[str, ScheduleConfig],
+    new_schedules: dict[str, ScheduleConfig],
     live_schedule_types: set[str],
 ) -> dict[str, tuple[str, str]]:
     """Identify schedule types whose ``workspace_mode`` changed across a reload.
@@ -417,6 +420,19 @@ class Orchestrator:
         self._retention_poison_pill_counts: dict[str, int] = {}           # child_id -> consecutive archive failure count
         self._retention_backlog_detected: bool = False                    # set True when a sweep fills its budget (dashboard, Unit 13)
         self._retention_last_archive_at: dict[str, datetime] = {}         # child_id -> last successful archive wall-clock (optional, for dashboard)
+
+        # P2-06: Per-tick children cache — populated once at the start of
+        # _evaluate_schedules and shared with _materialize_fire and
+        # _retention_sweep. Cleared at the end of _tick so stale data
+        # never leaks between ticks. None means cache not yet populated.
+        self._tick_children_cache: dict[str, list[Issue]] | None = None
+
+        # P2-18: Per-tick set of (template_id, slot) keys for which a skip
+        # watermark has already been posted this tick. Prevents duplicate
+        # skip watermarks when the same slot generates multiple decisions
+        # within the same tick (e.g., P2-03 in-flight re-check). Cleared
+        # alongside _tick_children_cache at the end of _tick.
+        self._tick_skip_watermark_posted: set[tuple[str, str]] = set()
 
         # R16: Workspace-mode change refusal. When a reload detects a
         # workspace_mode change on a schedule type that has live templates
@@ -888,6 +904,10 @@ class Orchestrator:
             children = self._template_children.get(template_id)
             if children is not None:
                 children.discard(issue_id)
+        # P2-07: clean retention state for this child so it doesn't leak
+        # after terminal transition or forced cleanup.
+        self._retention_poison_pill_counts.pop(issue_id, None)
+        self._retention_last_archive_at.pop(issue_id, None)
 
     async def _cleanup_template_state(self, template_id: str) -> None:
         """Idempotent cleanup of all per-template tracking state.
@@ -905,6 +925,17 @@ class Orchestrator:
             logger.warning(
                 f"Failed to remove persistent workspace for template {template_id}: {e}"
             )
+        # P2-07: clean retention state for all known children of this template
+        # before clearing _template_children. Children that never entered
+        # self.running (e.g., rehydrated-terminal children from Unit 8) would
+        # otherwise leak their retention tracking entries.
+        for child_id in list(self._template_children.get(template_id, set())):
+            self._retention_poison_pill_counts.pop(child_id, None)
+            self._retention_last_archive_at.pop(child_id, None)
+            # Also clean the reverse-index entry so _cleanup_issue_state
+            # doesn't try to double-remove from a set we're about to delete.
+            self._child_to_template.pop(child_id, None)
+
         self._templates.discard(template_id)
         self._template_snapshots.pop(template_id, None)
         self._template_children.pop(template_id, None)
@@ -1032,7 +1063,7 @@ class Orchestrator:
 
     def _resolve_schedule_config_for_template(
         self, template_id: str
-    ) -> "ScheduleConfig | None":  # noqa: F821 — forward ref
+    ) -> ScheduleConfig | None:
         """Resolve the ScheduleConfig for a template by snapshot lookup.
 
         Returns None if the template snapshot is missing or the template
@@ -2156,7 +2187,7 @@ class Orchestrator:
 
     def _resolve_schedule_config(
         self, template: Issue
-    ) -> "ScheduleConfig | None":  # noqa: F821 — forward ref
+    ) -> ScheduleConfig | None:
         """Look up the ScheduleConfig for a template, with case-insensitive match.
 
         Config keys in ``self.cfg.schedules`` preserve operator casing;
@@ -2251,6 +2282,24 @@ class Orchestrator:
         client = self._ensure_linear_client()
         now = datetime.now(timezone.utc)
 
+        # P2-06: Pre-fetch all template children ONCE and share with
+        # _materialize_fire and _retention_sweep within this tick.
+        # _tick clears the cache at the end so stale data doesn't persist.
+        if self._tick_children_cache is None:
+            self._tick_children_cache = {}
+            for tid in list(self._template_snapshots.keys()):
+                try:
+                    self._tick_children_cache[tid] = (
+                        await client.fetch_template_children(
+                            tid, include_archived=False
+                        )
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Pre-fetch children failed for template {tid}: {e}"
+                    )
+                    self._tick_children_cache[tid] = []
+
         # Build TemplateSnapshots for duplicate-label detection. Run this
         # first so losers are moved to Error before we waste API calls
         # fetching their comments / firing them.
@@ -2275,7 +2324,7 @@ class Orchestrator:
             logger.error(f"detect_duplicate_label failed: {e}", exc_info=True)
             winners, losers = all_snapshots, []
 
-        loser_ids = {l.id for l in losers}
+        loser_ids = {snap.id for snap in losers}
         for loser_snap in losers:
             tmpl = self._template_snapshots.get(loser_snap.id)
             if tmpl is None:
@@ -2386,7 +2435,36 @@ class Orchestrator:
             for decision in decisions:
                 try:
                     if decision.action == "fire":
-                        await self._materialize_fire(template, decision)
+                        # P2-03: recompute in_flight per-decision so a
+                        # Trigger-Now that fires first increments the count
+                        # before the same-tick cron-fire's overlap check.
+                        # This prevents a skip-overlap policy from
+                        # double-firing when both fire in the same tick.
+                        current_in_flight = len(
+                            self._template_children.get(template_id, set())
+                        )
+                        schedule_policy = getattr(
+                            schedule_cfg, "overlap_policy", "skip"
+                        ) or "skip"
+                        if (
+                            schedule_policy == "skip"
+                            and current_in_flight > 0
+                        ):
+                            logger.debug(
+                                f"P2-03 skip: {template.identifier} slot="
+                                f"{decision.slot} in_flight={current_in_flight}"
+                            )
+                            await self._post_skip_watermark(
+                                template,
+                                decision.__class__(
+                                    template_id=decision.template_id,
+                                    slot=decision.slot,
+                                    action="skip_overlap",
+                                    reason="overlap_policy=skip,children_in_flight",
+                                ),
+                            )
+                        else:
+                            await self._materialize_fire(template, decision)
                     else:
                         await self._post_skip_watermark(template, decision)
                 except Exception as e:
@@ -2421,6 +2499,23 @@ class Orchestrator:
             )
             return
 
+        # P2-18: guard against duplicate skip watermarks within the same tick.
+        # The evaluator already uses _slot_has_terminal_watermark to suppress
+        # re-evaluation across ticks, but within a single tick the in-memory
+        # watermarks don't include entries we just posted. Track posted
+        # (template_id, slot) pairs to prevent per-tick spam when a child is
+        # in-flight and both the evaluator and the P2-03 in-flight re-check
+        # emit skip_overlap for the same slot.
+        tick_key = (template.id, decision.slot)
+        if decision.action == "skip_overlap" and tick_key in self._tick_skip_watermark_posted:
+            logger.debug(
+                f"Skip-overlap watermark already posted this tick for "
+                f"{template.identifier} slot={decision.slot}; skipping duplicate"
+            )
+            return
+        if decision.action == "skip_overlap":
+            self._tick_skip_watermark_posted.add(tick_key)
+
         client = self._ensure_linear_client()
         seq = self._next_seq(template.id)
         body = make_fired_comment(
@@ -2454,7 +2549,7 @@ class Orchestrator:
 
     async def _retry_mutation(
         self,
-        coro_factory,  # callable returning a fresh awaitable each attempt
+        coro_factory: Callable[[], Awaitable[bool]],
         *,
         retries: int = 3,
         backoffs: tuple[float, ...] = (0.1, 0.3, 0.9),
@@ -2538,6 +2633,7 @@ class Orchestrator:
 
         client = self._ensure_linear_client()
         succeeded = True
+        mutation1_ok = True  # tracks whether mutation 1 (state transition) succeeded
 
         # --- Mutation 1: transition child state (unless already terminal) --
         already_terminal = self._is_child_already_terminal(child_id)
@@ -2561,6 +2657,7 @@ class Orchestrator:
                     f"on dashboard"
                 )
                 succeeded = False
+                mutation1_ok = False
 
         # --- Mutation 2: cancel comment on child ----------------------------
         try:
@@ -2616,19 +2713,29 @@ class Orchestrator:
             )
             succeeded = False
 
-        # Kill any running worker + clear per-issue tracking so the slot is
-        # freed for the new child. _kill_worker + _cleanup_issue_state are
-        # both idempotent; safe even when the child was only gated.
-        try:
-            await self._kill_worker(
-                child_id, reason=f"cancel_previous slot={triggering_slot}"
+        # P1-07: Only kill + cleanup when mutation 1 succeeded (or the child was
+        # already terminal). If the state-transition failed after retries, the
+        # child is still running/gated in Linear; removing it from our tracking
+        # dicts would orphan it permanently — _reconcile would stop observing it
+        # and it would never be cleaned up. Leave the child in self.running /
+        # tracking dicts so _reconcile can continue monitoring it.
+        if mutation1_ok:
+            try:
+                await self._kill_worker(
+                    child_id, reason=f"cancel_previous slot={triggering_slot}"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"cancel_previous: _kill_worker no-op/failed for "
+                    f"child={child_identifier}: {e}"
+                )
+            self._cleanup_issue_state(child_id)
+        else:
+            logger.warning(
+                f"cancel_previous: skipping kill+cleanup for "
+                f"child={child_identifier} because state-transition failed; "
+                f"_reconcile will continue monitoring it"
             )
-        except Exception as e:
-            logger.debug(
-                f"cancel_previous: _kill_worker no-op/failed for "
-                f"child={child_identifier}: {e}"
-            )
-        self._cleanup_issue_state(child_id)
 
         return succeeded
 
@@ -2695,27 +2802,75 @@ class Orchestrator:
         client = self._ensure_linear_client()
         slot = decision.slot
         key = (template.id, slot)
+
+        # P1-05: seed the attempt counter from pre-existing failed watermarks
+        # on restart so the counter survives process restarts. Only seed once
+        # per (template, slot) — once we have an in-memory value we own it.
+        if key not in self._template_fire_attempts:
+            try:
+                seed_comments = await client.fetch_comments(template.id)
+                seed_parsed = parse_fired_by_slot(seed_comments or [])
+                slot_payload = seed_parsed.get(slot)
+                if slot_payload and slot_payload.get("status") in (
+                    "failed", "pending"
+                ):
+                    try:
+                        seeded_n = int(slot_payload.get("attempt") or 0)
+                    except (TypeError, ValueError):
+                        seeded_n = 0
+                    if seeded_n > 0:
+                        self._template_fire_attempts[key] = seeded_n
+                        logger.debug(
+                            f"Seeded fire_attempts for "
+                            f"{template.identifier} slot={slot} "
+                            f"from watermark attempt={seeded_n}"
+                        )
+            except Exception as e:
+                logger.debug(
+                    f"Fire-attempt seeding failed for "
+                    f"{template.identifier} slot={slot}: {e}"
+                )
+
         attempts_before = self._template_fire_attempts.get(key, 0)
 
         # --- Step 1: duplicate-sibling check ----------------------------
-        try:
-            siblings = await client.fetch_template_children(
-                template.id, include_archived=False
-            )
-        except Exception as e:
-            logger.warning(
-                f"fetch_template_children failed for "
-                f"{template.identifier}: {e}; skipping this fire"
-            )
-            return
+        # P2-06: use the per-tick cache when available (populated by
+        # _evaluate_schedules before the decision loop). Fall back to a
+        # live fetch only when the cache is absent (e.g., called outside
+        # a tick, or cache population failed for this template).
+        cached_siblings = (
+            self._tick_children_cache.get(template.id)
+            if self._tick_children_cache is not None
+            else None
+        )
+        if cached_siblings is not None:
+            siblings = cached_siblings
+        else:
+            try:
+                siblings = await client.fetch_template_children(
+                    template.id, include_archived=False
+                )
+            except Exception as e:
+                logger.warning(
+                    f"fetch_template_children failed for "
+                    f"{template.identifier}: {e}; skipping this fire"
+                )
+                return
 
+        # P1-03: pass ALL non-archived siblings (including terminal ones) so
+        # that a completed/canceled child still deduplicates the slot on the
+        # crash-recovery path. ``find_existing_child_for_slot`` filters
+        # archived_at internally.
+        all_siblings = [c for c in siblings if c.archived_at is None]
+
+        # For overlap-policy mechanics (cancel_previous) we still need the
+        # non-terminal subset — keep the original active_siblings for that.
         active_siblings = [
-            c for c in siblings
-            if c.archived_at is None
-            and (c.state_type or "").lower() not in ("completed", "canceled")
+            c for c in all_siblings
+            if (c.state_type or "").lower() not in ("completed", "canceled")
         ]
 
-        existing = find_existing_child_for_slot(active_siblings, slot)
+        existing = find_existing_child_for_slot(all_siblings, slot)
         if existing is not None:
             seq = self._next_seq(template.id)
             body = make_fired_comment(
@@ -2868,6 +3023,7 @@ class Orchestrator:
         desired_labels.append(slot_label_name(slot))
 
         label_ids: list[str] = []
+        slot_label = slot_label_name(slot)
         try:
             resolved = await client.resolve_label_ids(
                 template.team_id, desired_labels,
@@ -2875,9 +3031,30 @@ class Orchestrator:
         except Exception as e:
             logger.warning(
                 f"resolve_label_ids failed for {template.identifier}: {e}; "
-                f"proceeding without label IDs"
+                f"bumping fire attempt counter"
             )
             resolved = {}
+
+        # P1-04: the slot label is the duplicate-detection primitive. If it
+        # doesn't exist (and cannot be resolved) we must NOT create the child
+        # without it — that child would be invisible to the dedup check and
+        # every subsequent tick would materialize another one. Fail the attempt
+        # so the operator can create the label and the retry will succeed.
+        if slot_label not in resolved:
+            new_attempts = attempts_before + 1
+            self._template_fire_attempts[key] = new_attempts
+            logger.warning(
+                f"Slot label {slot_label!r} not found in team "
+                f"{template.team_id!r} — cannot create child without dedup "
+                f"primitive. Create the label in Linear. Attempt "
+                f"{new_attempts}/{MAX_FIRE_ATTEMPTS}."
+            )
+            if new_attempts >= MAX_FIRE_ATTEMPTS:
+                await self._move_template_to_error(
+                    template,
+                    f"slot_label_missing:{slot_label}",
+                )
+            return
 
         for name in desired_labels:
             if name in resolved:
@@ -2885,8 +3062,7 @@ class Orchestrator:
             else:
                 logger.warning(
                     f"Label {name!r} not found in team {template.team_id!r}; "
-                    f"child for slot {slot} will not carry it. Create the "
-                    f"label in Linear to enable duplicate-sibling detection."
+                    f"child for slot {slot} will not carry it."
                 )
 
         title = build_child_title(template.title, slot)
@@ -2949,6 +3125,22 @@ class Orchestrator:
                 f"Fire success template={template.identifier} slot={slot} "
                 f"child={created.identifier or created.id} attempt={attempt_n}"
             )
+            # P1-02: Trigger-Now fires every tick until the template is moved back
+            # to Scheduled. Do that now, on the success path, so subsequent ticks
+            # don't re-evaluate this slot as a Trigger-Now decision.
+            if decision.is_trigger_now:
+                scheduled_state = self.cfg.linear_states.schedule_scheduled or ""
+                if scheduled_state:
+                    try:
+                        await client.update_issue_state(
+                            template.id, scheduled_state
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Trigger-Now: failed to move template "
+                            f"{template.identifier} back to Scheduled: {e}; "
+                            f"next tick may re-evaluate (non-fatal)"
+                        )
             return
 
         # --- Steps 5/6: failure ---------------------------------------
@@ -3038,20 +3230,24 @@ class Orchestrator:
         """
         try:
             client = self._ensure_linear_client()
-            # Idempotency check — fetch latest schedule_error comment and
-            # compare reason. Fetch failures fall through to post the new
-            # comment (safer to risk a duplicate than to skip a real error).
-            existing_reason: str | None = None
-            try:
-                comments = await client.fetch_comments(template.id)
-                latest = parse_latest_schedule_error(comments or [])
-                if latest is not None:
-                    existing_reason = latest.get("reason")
-            except Exception as e:
-                logger.debug(
-                    f"Idempotency check for schedule_error failed "
-                    f"(template={template.identifier}): {e}; posting anyway"
-                )
+            # Idempotency check — compare against cached reason first.
+            # Only hit Linear when the cache is empty (first tick after restart).
+            # This prevents fetching comments every tick when a template stays
+            # stuck on the same error (P2-04).
+            existing_reason: str | None = self._template_error_reasons.get(
+                template.id
+            )
+            if existing_reason is None:
+                try:
+                    comments = await client.fetch_comments(template.id)
+                    latest = parse_latest_schedule_error(comments or [])
+                    if latest is not None:
+                        existing_reason = latest.get("reason")
+                except Exception as e:
+                    logger.debug(
+                        f"Idempotency check for schedule_error failed "
+                        f"(template={template.identifier}): {e}; posting anyway"
+                    )
 
             same_reason = (existing_reason == reason)
             if not same_reason:
@@ -3206,16 +3402,26 @@ class Orchestrator:
             if retention_days < 1:
                 continue
 
-            try:
-                children = await client.fetch_template_children(
-                    template_id, include_archived=False
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Retention sweep: failed to fetch children for "
-                    f"template={template.identifier}: {e}"
-                )
-                continue
+            # P2-06: use per-tick cache when available (populated by
+            # _evaluate_schedules). Fall back to live fetch otherwise.
+            cached = (
+                self._tick_children_cache.get(template_id)
+                if self._tick_children_cache is not None
+                else None
+            )
+            if cached is not None:
+                children = cached
+            else:
+                try:
+                    children = await client.fetch_template_children(
+                        template_id, include_archived=False
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Retention sweep: failed to fetch children for "
+                        f"template={template.identifier}: {e}"
+                    )
+                    continue
 
             candidates = select_retention_candidates(
                 children, now, retention_days,
@@ -3253,8 +3459,10 @@ class Orchestrator:
                     )
                     ok = False
 
-                budget -= 1
                 if ok:
+                    # P2-01: only decrement budget on success so failed
+                    # archives don't eat budget without making progress.
+                    budget -= 1
                     # Success: clear any previous failure state for this
                     # child; record wall-clock for dashboard.
                     self._retention_poison_pill_counts.pop(child.id, None)
@@ -3429,6 +3637,12 @@ class Orchestrator:
             await self._retention_sweep()
         except Exception as e:
             logger.error(f"Retention sweep failed: {e}", exc_info=True)
+        finally:
+            # P2-06: clear the per-tick children cache so stale data never
+            # leaks into the next tick.
+            self._tick_children_cache = None
+            # P2-18: clear the skip-watermark dedup set for the next tick.
+            self._tick_skip_watermark_posted.clear()
 
     async def _resolve_repo_for_coldstart(
         self,
@@ -4477,7 +4691,10 @@ class Orchestrator:
         errors must not poison the threshold.
         """
         ids_to_check = (
-            set(self.running) | set(self._pending_gates) | set(self._templates)
+            set(self.running)
+            | set(self._pending_gates)
+            | set(self._templates)
+            | set(self._template_children.keys())  # P1-01: include deleted-template IDs
         )
         if not ids_to_check:
             return
@@ -4521,9 +4738,13 @@ class Orchestrator:
             if current_state is None:
                 # Issue not found in Linear — may be deleted/archived.
                 # Discriminate: template vs gated vs running.
+                # P1-01: include _template_children.keys() so template IDs that
+                # were removed from _templates (e.g. after config reload) but
+                # still have in-flight children are still classified as
+                # "template" and receive the N-tick threshold treatment.
                 kind = classify_missing_id(
                     issue_id,
-                    self._templates,
+                    self._templates | set(self._template_children.keys()),
                     self.running,
                     self._pending_gates,
                 )
@@ -4676,6 +4897,20 @@ class Orchestrator:
             "schedules": schedules,
             "schedule_errors": schedule_errors,
             "retention_metrics": retention_metrics,
+            # P3-11: surface workspace-mode change ack requirements so
+            # operators can see the required hash without reading logs.
+            "workspace_mode_ack": (
+                {
+                    "required": True,
+                    "change_hash": self._workspace_mode_refused_hash,
+                    "changes": {
+                        k: {"from": v[0], "to": v[1]}
+                        for k, v in self._workspace_mode_refused_changes.items()
+                    },
+                }
+                if self._workspace_mode_refused
+                else {"required": False}
+            ),
         }
 
     # --- Scheduled-jobs snapshot helpers (Unit 13) -----------------------
@@ -4690,10 +4925,10 @@ class Orchestrator:
         to avoid burning CPU on per-snapshot croniter calls when multiple
         dashboard tabs poll ``/api/v1/state``.
 
-        ``children_terminal_pending_retention`` is intentionally 0 for the
-        MVP — no per-template terminal-but-not-archived counter exists yet
-        (would require scanning children on every tick). The dashboard
-        renders it as "—" until a future unit adds the counter.
+        Pure dict composition over existing tracking dicts. ``next_fire_at``
+        is a *cached* value (populated per-tick in ``_evaluate_schedules``)
+        to avoid burning CPU on per-snapshot croniter calls when multiple
+        dashboard tabs poll ``/api/v1/state``.
         """
         schedules: list[dict[str, Any]] = []
         schedule_errors: list[dict[str, Any]] = []
@@ -4747,10 +4982,6 @@ class Orchestrator:
                     last_fire_dt.isoformat() if last_fire_dt else None
                 ),
                 "children_active": children_active,
-                # TODO(unit-future): track per-template terminal-but-not-
-                # yet-archived children to populate this. Dashboard renders
-                # 0 / "—" today.
-                "children_terminal_pending_retention": 0,
                 "error_reason": error_reason,
                 "error_since": (
                     error_since_dt.isoformat() if error_since_dt else None
@@ -4791,9 +5022,6 @@ class Orchestrator:
             last_archive_at = max(self._retention_last_archive_at.values())
 
         return {
-            # TODO(unit-future): surface real pending-archive count — needs
-            # terminal-child scan beyond the scope of Unit 13.
-            "pending_archive_count": 0,
             "backlog_detected": bool(self._retention_backlog_detected),
             "poison_pill_count": len(self._retention_poison_pill_counts),
             "last_archive_at": (

@@ -99,14 +99,6 @@ def build_scope_restriction(
     return base + carve_out
 
 
-# Backwards-compatibility alias: legacy callers used a module-level constant
-# with a ``{issue_identifier}`` slot. Prefer ``build_scope_restriction()``.
-SCOPE_RESTRICTION_SYSTEM = (
-    "Do NOT use Linear tools to modify, comment on, or transition any Linear issue "
-    "other than {issue_identifier}. You may read other issues for context, but do "
-    "not take any write action on them."
-)
-
 
 def build_claude_args(
     claude_cfg: ClaudeConfig,
@@ -202,6 +194,11 @@ async def run_codex_turn(
 
     Codex doesn't support session resumption or stream-json output.
     We capture stdout/stderr and use exit code for status.
+
+    P3-10: Codex does not inject scope restrictions — there is no
+    equivalent of ``build_scope_restriction()`` / ``template_identifier``
+    for the Codex path. ``template_identifier`` is intentionally absent
+    from this function's signature.
     """
     args = build_codex_args(model, prompt, workspace_path)
 

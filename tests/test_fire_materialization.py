@@ -380,3 +380,320 @@ class TestMaxFireAttemptsConstant:
         # The plan specifies MAX=5; tests and Unit 8 retention helpers
         # both read from this constant, so guard against accidental edits.
         assert MAX_FIRE_ATTEMPTS == 5
+
+
+# ---------------------------------------------------------------------------
+# P1-03: Terminal siblings still count as evidence the slot was materialized
+# ---------------------------------------------------------------------------
+
+
+class TestFindExistingChildForSlotIncludesTerminal:
+    """P1-03 fix: completed/canceled children must dedup the slot."""
+
+    def test_completed_child_matches(self):
+        c = _child(
+            id="completed-1",
+            labels=["slot:2026-04-19t08:00:00z"],
+            state_type="completed",
+        )
+        result = find_existing_child_for_slot([c], "2026-04-19T08:00:00Z")
+        assert result is c
+
+    def test_canceled_child_matches(self):
+        c = _child(
+            id="canceled-1",
+            labels=["slot:2026-04-19t08:00:00z"],
+            state_type="canceled",
+        )
+        result = find_existing_child_for_slot([c], "2026-04-19T08:00:00Z")
+        assert result is c
+
+    def test_archived_terminal_still_excluded(self):
+        # archived_at overrides everything — archived issues are not siblings.
+        c = _child(
+            id="arch-1",
+            labels=["slot:2026-04-19t08:00:00z"],
+            state_type="completed",
+            archived_at=datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc),
+        )
+        result = find_existing_child_for_slot([c], "2026-04-19T08:00:00Z")
+        assert result is None
+
+    def test_decide_materialize_step_dedupes_on_terminal_sibling(self):
+        """decide_materialize_step sees terminal sibling and returns duplicate."""
+        sibling = _child(
+            id="done-sib",
+            labels=["slot:2026-04-19t08:00:00z"],
+            state_type="completed",
+        )
+        step = decide_materialize_step(
+            _fire_decision(), existing_children=[sibling], current_attempts=0,
+        )
+        assert step.kind == "duplicate"
+        assert step.existing_child_id == "done-sib"
+
+
+# ---------------------------------------------------------------------------
+# P1-02: Trigger-Now fires every tick — orchestrator integration
+# ---------------------------------------------------------------------------
+
+
+def _make_orch_with_schedules(tmp_path):
+    """Build minimal Orchestrator with a schedule config + fake client."""
+    from stokowski.orchestrator import Orchestrator
+
+    wf_path = tmp_path / "workflow.yaml"
+    wf_path.write_text(
+        """
+tracker:
+  api_key: test-key
+  project_slug: abc123
+
+linear_states:
+  schedule_scheduled: Scheduled
+
+schedules:
+  daily:
+    workflow: default
+    overlap_policy: skip
+    workspace_mode: ephemeral
+    on_missed: skip
+
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  default:
+    default: true
+    path: [plan, done]
+"""
+    )
+    orch = Orchestrator(str(wf_path))
+    errors = orch._load_workflow()
+    assert not errors, f"Config errors: {errors}"
+    return orch
+
+
+class FakeClientForMaterialize:
+    """Stub Linear client for _materialize_fire tests."""
+
+    def __init__(self, *, child_id: str = "new-child-id"):
+        self._child_id = child_id
+        self.state_updates: list[tuple[str, str]] = []
+        self.comments_posted: list[tuple[str, str]] = []
+        self.template_children: list = []
+        self.label_ids: dict[str, str] = {}
+
+    async def fetch_template_children(self, template_id, include_archived=False):
+        return list(self.template_children)
+
+    async def fetch_comments(self, issue_id):
+        return []
+
+    async def resolve_label_ids(self, team_id, names):
+        return {n: self.label_ids.get(n, f"label-{n}") for n in names}
+
+    async def create_child_issue(self, *, parent_id, team_id, title,
+                                  description="", label_ids=None):
+        from stokowski.models import Issue
+        return Issue(
+            id=self._child_id,
+            identifier="CHD-1",
+            title=title,
+        )
+
+    async def update_issue_state(self, issue_id: str, state_name: str) -> bool:
+        self.state_updates.append((issue_id, state_name))
+        return True
+
+    async def post_comment(self, issue_id: str, body: str) -> bool:
+        self.comments_posted.append((issue_id, body))
+        return True
+
+    async def close(self):
+        pass
+
+
+class TestTriggerNowResetsTemplateToScheduled:
+    """P1-02: after a Trigger-Now fire succeeds, template moves to Scheduled."""
+
+    def test_trigger_now_calls_update_issue_state(self, tmp_path):
+        import asyncio
+        from stokowski.scheduler import FireDecision
+
+        orch = _make_orch_with_schedules(tmp_path)
+        fake = FakeClientForMaterialize()
+        # Pre-populate label resolution so slot label resolves
+        fake.label_ids = {
+            "slot:trigger:2026-04-19T08:00:00Z": "lbl-slot",
+            "schedule:daily": "lbl-sched",
+        }
+        orch._linear = fake
+
+        template = _child(
+            id="tmpl-1",
+            identifier="TPL-1",
+            labels=["schedule:daily"],
+        )
+        # Give template team_id so create_child_issue doesn't fail with missing_team_id
+        object.__setattr__(template, "team_id", "team-1") if hasattr(template, "__setattr__") else None
+        # Use a regular mutable Issue instead
+        from stokowski.models import Issue
+        template = Issue(
+            id="tmpl-1",
+            identifier="TPL-1",
+            title="Daily Report",
+            labels=["schedule:daily"],
+            team_id="team-1",
+        )
+
+        decision = FireDecision(
+            template_id="tmpl-1",
+            slot="trigger:2026-04-19T08:00:00Z",
+            action="fire",
+            reason=None,
+            is_trigger_now=True,
+        )
+
+        asyncio.run(orch._materialize_fire(template, decision))
+
+        # The state update must have been called with the Scheduled state.
+        assert any(
+            issue_id == "tmpl-1" and state == "Scheduled"
+            for issue_id, state in fake.state_updates
+        ), f"expected update to Scheduled, got: {fake.state_updates}"
+
+    def test_cron_fire_does_not_reset_template(self, tmp_path):
+        import asyncio
+        from stokowski.scheduler import FireDecision
+        from stokowski.models import Issue
+
+        orch = _make_orch_with_schedules(tmp_path)
+        fake = FakeClientForMaterialize()
+        fake.label_ids = {
+            "slot:2026-04-19T08:00:00Z": "lbl-slot",
+            "schedule:daily": "lbl-sched",
+        }
+        orch._linear = fake
+
+        template = Issue(
+            id="tmpl-1",
+            identifier="TPL-1",
+            title="Daily Report",
+            labels=["schedule:daily"],
+            team_id="team-1",
+        )
+
+        decision = FireDecision(
+            template_id="tmpl-1",
+            slot="2026-04-19T08:00:00Z",
+            action="fire",
+            reason=None,
+            is_trigger_now=False,  # cron fire
+        )
+
+        asyncio.run(orch._materialize_fire(template, decision))
+
+        # No state update for template (cron fires don't reset state).
+        assert not any(
+            issue_id == "tmpl-1"
+            for issue_id, _ in fake.state_updates
+        ), f"unexpected state update: {fake.state_updates}"
+
+
+# ---------------------------------------------------------------------------
+# P1-05: Fire-attempt counter seeded from failed watermarks on restart
+# ---------------------------------------------------------------------------
+
+
+class TestFireAttemptCounterSeededFromWatermarks:
+    """P1-05: _materialize_fire seeds _template_fire_attempts from existing
+    failed watermarks so restarts don't reset the counter to 0."""
+
+    def _make_failed_watermark_comment(self, slot: str, attempt: int) -> dict:
+        """Build a raw Linear comment dict containing a failed watermark."""
+        import json
+        payload = {
+            "template": "TPL-1",
+            "slot": slot,
+            "status": "failed",
+            "attempt": attempt,
+            "reason": "create_rejected",
+            "seq": attempt,
+            "timestamp": "2026-04-19T08:00:00Z",
+        }
+        body = f"<!-- stokowski:fired {json.dumps(payload)} -->"
+        return {"id": f"comment-{attempt}", "body": body, "createdAt": "2026-04-19T08:00:00Z"}
+
+    def test_seeded_from_three_failed_watermarks(self, tmp_path):
+        import asyncio
+        from stokowski.scheduler import FireDecision
+        from stokowski.models import Issue
+
+        orch = _make_orch_with_schedules(tmp_path)
+
+        slot = "2026-04-19T08:00:00Z"
+        # Build a fake client that returns 3 pre-existing failed watermarks.
+        existing_comments = [
+            self._make_failed_watermark_comment(slot, i) for i in range(1, 4)
+        ]
+
+        class FakeWithComments(FakeClientForMaterialize):
+            async def fetch_comments(self, issue_id):
+                return existing_comments
+
+            async def resolve_label_ids(self, team_id, names):
+                # Return all labels so the slot label resolves
+                return {n: f"lbl-{n}" for n in names}
+
+        fake = FakeWithComments()
+        orch._linear = fake
+
+        template = Issue(
+            id="tmpl-1",
+            identifier="TPL-1",
+            title="Daily Report",
+            labels=["schedule:daily"],
+            team_id="team-1",
+        )
+
+        decision = FireDecision(
+            template_id="tmpl-1",
+            slot=slot,
+            action="fire",
+            reason=None,
+            is_trigger_now=False,
+        )
+
+        asyncio.run(orch._materialize_fire(template, decision))
+
+        # After materialization, the key should have been seeded.
+        # The fire succeeded, so _template_fire_attempts is popped for this key.
+        # But we can verify the logic by checking that if we add a second call
+        # with a fresh orch whose counter is already seeded, it uses attempt 4.
+        # Instead, verify by inspecting the seeding logic directly.
+        # Build a second orch without the success path — fail the create.
+        orch2 = _make_orch_with_schedules(tmp_path)
+
+        class FakeWithCommentsFail(FakeWithComments):
+            async def create_child_issue(self, *, parent_id, team_id, title,
+                                          description="", label_ids=None):
+                return None  # force failure path
+
+        fake2 = FakeWithCommentsFail()
+        orch2._linear = fake2
+
+        asyncio.run(orch2._materialize_fire(template, decision))
+
+        # After one failed materialization seeded from 3 pre-existing failed
+        # watermarks, the counter should be at attempt 4 (3 pre-existing + 1 new).
+        key = ("tmpl-1", slot)
+        assert orch2._template_fire_attempts.get(key, 0) == 4, (
+            f"expected attempt 4 (seeded 3 + incremented 1), "
+            f"got {orch2._template_fire_attempts.get(key, 0)}"
+        )

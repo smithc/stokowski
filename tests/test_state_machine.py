@@ -474,13 +474,6 @@ class TestScopeCarveOut:
         b = build_scope_restriction("SMI-1", template_identifier=None)
         assert a == b
 
-    def test_legacy_constant_still_exposed(self):
-        """SCOPE_RESTRICTION_SYSTEM constant must remain importable for
-        backwards compatibility with any external code."""
-        from stokowski.runner import SCOPE_RESTRICTION_SYSTEM
-
-        assert "{issue_identifier}" in SCOPE_RESTRICTION_SYSTEM
-
     def test_system_prompt_includes_carve_out_when_template_passed(self):
         """build_claude_args threads template_identifier into the system
         prompt when provided."""

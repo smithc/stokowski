@@ -8,7 +8,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from stokowski.models import Issue
@@ -136,8 +136,11 @@ class LinearStatesConfig:
     canceled: str = "Canceled"
 
 
-# Valid overlap policies for ScheduleConfig.overlap_policy
-_SCHEDULE_OVERLAP_POLICIES = ("skip", "queue", "cancel_previous", "parallel")
+# Valid overlap policies for ScheduleConfig.overlap_policy.
+# ``queue`` is reserved for a future release and is rejected at validation
+# time — it is listed here so the error message can mention it explicitly.
+_SCHEDULE_OVERLAP_POLICIES = ("skip", "cancel_previous", "parallel")
+_SCHEDULE_OVERLAP_POLICIES_RESERVED = ("queue",)
 # Valid workspace modes for ScheduleConfig.workspace_mode
 _SCHEDULE_WORKSPACE_MODES = ("ephemeral", "persistent")
 # Valid on_missed policies for ScheduleConfig.on_missed
@@ -156,9 +159,9 @@ class ScheduleConfig:
     """
     name: str = ""
     workflow: str = ""
-    overlap_policy: str = "skip"  # one of _SCHEDULE_OVERLAP_POLICIES
-    workspace_mode: str = "ephemeral"  # one of _SCHEDULE_WORKSPACE_MODES
-    on_missed: str = "skip"  # one of _SCHEDULE_ON_MISSED
+    overlap_policy: Literal["skip", "cancel_previous", "parallel"] = "skip"
+    workspace_mode: Literal["ephemeral", "persistent"] = "ephemeral"
+    on_missed: Literal["run_all", "run_once", "skip"] = "skip"
     run_all_cap: int = 5
     retention_days: int = 30
     max_runtime_ms: int | None = None
@@ -1099,8 +1102,15 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
                     f"'{sc.workflow}'"
                 )
 
-            # overlap_policy must be a valid literal
-            if sc.overlap_policy not in _SCHEDULE_OVERLAP_POLICIES:
+            # overlap_policy must be a valid literal.
+            # ``queue`` is reserved for a future release — reject it
+            # explicitly with a clear message.
+            if sc.overlap_policy in _SCHEDULE_OVERLAP_POLICIES_RESERVED:
+                errors.append(
+                    f"overlap_policy: queue is not yet implemented. "
+                    f"Use skip, cancel_previous, or parallel."
+                )
+            elif sc.overlap_policy not in _SCHEDULE_OVERLAP_POLICIES:
                 errors.append(
                     f"Schedule '{sched_name}' has invalid overlap_policy: "
                     f"'{sc.overlap_policy}' "

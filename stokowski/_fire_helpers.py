@@ -11,12 +11,15 @@ Everything in this module is I/O-free and mutation-free, matching the
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Literal
 
 from .models import Issue
-from .scheduler import FireDecision, Watermark
+from .scheduler import FireAction, FireDecision, Watermark
+
+logger = logging.getLogger("stokowski.fire_helpers")
 
 # Hard cap on fire-attempt retries before the template is moved to Error.
 # Matches the plan default (Unit 6). Exposed as a module constant so tests
@@ -70,14 +73,20 @@ def child_has_slot_label(
 
 def find_existing_child_for_slot(
     children: Iterable[Issue], canonical_slot: str
-) -> Optional[Issue]:
-    """Return the first non-archived active child carrying the slot label.
+) -> Issue | None:
+    """Return the first non-archived child (any state) carrying the slot label.
 
     Used by step 1 of ``_materialize_fire`` to recover from
-    crash-between-create-and-watermark-update. Callers filter by
-    "active" vs. "archived" upstream where possible; we also honor
-    ``archived_at`` here defensively so a stale archived sibling never
-    shadows a fresh fire.
+    crash-between-create-and-watermark-update. We accept completed and
+    canceled siblings as evidence a child exists — their presence means
+    the slot was already materialized and the child ran to completion.
+    Only hard-archived issues (``archived_at`` is not None) are excluded
+    because they have been physically removed from the active sibling list
+    and could shadow a legitimate re-fire in some edge cases.
+
+    P1-03 fix: previously this function filtered out completed/canceled
+    children, which broke idempotency on the crash-recovery path when a
+    terminal child was the only evidence the slot had fired.
     """
     for child in children:
         if child.archived_at is not None:
@@ -101,10 +110,10 @@ def build_child_title(template_title: str, slot: str) -> str:
 def build_child_description(
     *,
     template_identifier: str,
-    template_url: Optional[str],
+    template_url: str | None,
     slot: str,
-    cron_expr: Optional[str],
-    schedule_name: Optional[str],
+    cron_expr: str | None,
+    schedule_name: str | None,
     is_trigger: bool,
 ) -> str:
     """Render the child's description (audit trail + routing note).
@@ -155,7 +164,7 @@ def watermarks_from_parsed(
     for slot, payload in parsed.items():
         try:
             ts_raw = payload.get("timestamp")
-            ts_dt: Optional[datetime] = None
+            ts_dt: datetime | None = None
             if isinstance(ts_raw, str) and ts_raw:
                 try:
                     ts_dt = datetime.fromisoformat(
@@ -195,9 +204,12 @@ def watermarks_from_parsed(
                     seq=seq_val,
                 )
             )
-        except Exception:
+        except Exception as e:
             # Forward-compat: malformed entries are ignored rather than
             # aborting the whole evaluator pass.
+            logger.debug(
+                "Skipping malformed watermark entry: %s", e, exc_info=True
+            )
             continue
     return out
 
@@ -229,15 +241,6 @@ def max_seq_from_parsed(parsed: dict[str, dict[str, Any]]) -> int:
 # ---------------------------------------------------------------------------
 
 
-FireAction = Literal[
-    "fire",
-    "skip_overlap",
-    "skip_bounded",
-    "skip_paused",
-    "skip_error",
-]
-
-
 @dataclass(frozen=True)
 class MaterializeStep:
     """Pure description of what ``_materialize_fire`` will do for a decision.
@@ -252,7 +255,7 @@ class MaterializeStep:
         "post_pending",    # no sibling → post pending watermark
         "fail_permanent",  # attempts exceeded → skip to Error transition
     ]
-    existing_child_id: Optional[str] = None
+    existing_child_id: str | None = None
     attempt_number: int = 0
 
 
@@ -297,6 +300,7 @@ def decide_materialize_step(
 
 __all__ = [
     "MAX_FIRE_ATTEMPTS",
+    "FireAction",  # re-exported from scheduler for backward compat
     "MaterializeStep",
     "build_child_description",
     "build_child_title",

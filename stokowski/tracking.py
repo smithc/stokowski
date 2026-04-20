@@ -6,7 +6,10 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeAlias
+
+# Sort-key type for watermark supersession ordering in _fired_sort_key.
+_SortKey: TypeAlias = tuple[tuple, int, int]
 
 logger = logging.getLogger("stokowski.tracking")
 
@@ -442,7 +445,7 @@ def _parse_fired_payload(body: str) -> dict[str, Any] | None:
     return data
 
 
-def _fired_sort_key(entry: dict[str, Any], index: int) -> tuple:
+def _fired_sort_key(entry: dict[str, Any], index: int) -> _SortKey:
     """Sort key for watermark supersession.
 
     Primary: timestamp (lexicographic ISO-8601 sort works when all entries

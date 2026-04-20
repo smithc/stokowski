@@ -434,3 +434,50 @@ class TestRehydrateTemplateIndexes:
         # tmpl-2 populated.
         assert orch._template_children["tmpl-2"] == {"c-b"}
         assert orch._child_to_template["c-b"] == "tmpl-2"
+
+
+# ---------------------------------------------------------------------------
+# P1-01: Template hard-delete cascade must fire even after _templates cleared
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileTemplateChildrenKeptInCheckSet:
+    """P1-01: _template_children.keys() must be included in ids_to_check so
+    deleted template IDs stay observable long enough for the N-tick threshold
+    to trigger _cascade_template_delete."""
+
+    def test_template_absent_from_fetch_but_in_children_increments_counter(
+        self, tmp_path
+    ):
+        orch = _make_orch(tmp_path)
+        # Template is known only via _template_children (e.g., was cleaned from
+        # _templates by a transient config reload but children remain).
+        orch._template_children["tmpl-orphan"] = {"child-a"}
+        orch._template_snapshots["tmpl-orphan"] = Issue(
+            id="tmpl-orphan", identifier="TPL-O", title="t"
+        )
+        # NOT in orch._templates — simulates template removed from Linear
+        # but not yet cascaded (e.g., on the first tick after detection).
+        orch._linear = FakeLinearClient(states_by_id={})
+
+        asyncio.run(orch._reconcile())
+
+        # counter must have incremented because tmpl-orphan is in
+        # _template_children.keys() and was absent from Linear response.
+        assert orch._template_last_seen.get("tmpl-orphan", 0) >= 1
+
+    def test_cascade_fires_for_template_tracked_only_in_children(self, tmp_path):
+        orch = _make_orch(tmp_path)
+        # Simulate template that only lives in _template_children (no _templates entry).
+        orch._template_children["tmpl-ghost"] = set()
+        orch._template_snapshots["tmpl-ghost"] = Issue(
+            id="tmpl-ghost", identifier="TPL-G", title="g"
+        )
+        orch._linear = FakeLinearClient(states_by_id={})
+
+        for _ in range(TEMPLATE_HARD_DELETE_THRESHOLD_TICKS):
+            asyncio.run(orch._reconcile())
+
+        # After threshold ticks, cascade should have run (clears _template_children).
+        assert "tmpl-ghost" not in orch._template_children
+        assert "tmpl-ghost" not in orch._template_snapshots

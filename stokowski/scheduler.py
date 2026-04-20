@@ -22,10 +22,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Iterable, Literal, Optional
+from typing import TYPE_CHECKING, Iterable, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
+    from croniter import croniter  # noqa: F401 — type annotation only
     from .config import ScheduleConfig
 
 
@@ -63,7 +64,7 @@ class TemplateSnapshot:
     cron_expr: str
     timezone: str
     labels: tuple[str, ...] = ()
-    created_at: Optional[datetime] = None
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -77,10 +78,10 @@ class Watermark:
     template_id: str
     slot: str
     status: str  # pending | child | failed | failed_permanent | skipped_*
-    child_id: Optional[str] = None
-    attempt: Optional[int] = None
-    reason: Optional[str] = None
-    timestamp: Optional[datetime] = None
+    child_id: str | None = None
+    attempt: int | None = None
+    reason: str | None = None
+    timestamp: datetime | None = None
     seq: int = 0
 
 
@@ -105,14 +106,14 @@ class FireDecision:
     template_id: str
     slot: str
     action: FireAction
-    reason: Optional[str] = None
+    reason: str | None = None
     is_trigger_now: bool = False
     # Number of slots dropped by ``run_all`` bound exceeded. Populated only
     # on ``skip_bounded`` decisions that carry the aggregate drop count.
     bounded_dropped_count: int = 0
     # Window of the bounded drop (for the aggregate bounded_drop comment).
-    bounded_drop_earliest: Optional[str] = None
-    bounded_drop_latest: Optional[str] = None
+    bounded_drop_earliest: str | None = None
+    bounded_drop_latest: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +184,7 @@ def detect_error(template_state: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def parse_cron_and_tz(cron_expr: str, tz_name: str):
+def parse_cron_and_tz(cron_expr: str, tz_name: str) -> tuple[croniter, ZoneInfo]:
     """Parse a cron expression + IANA timezone into a croniter iterator.
 
     Returns ``(croniter_instance, ZoneInfo)``. The croniter instance is
@@ -226,12 +227,12 @@ def parse_cron_and_tz(cron_expr: str, tz_name: str):
 
 
 def compute_missed_slots(
-    last_fired_slot: Optional[datetime],
+    last_fired_slot: datetime | None,
     now: datetime,
     cron_expr: str,
     tz: ZoneInfo,
     *,
-    earliest_anchor: Optional[datetime] = None,
+    earliest_anchor: datetime | None = None,
     max_iterations: int = 10_000,
 ) -> list[datetime]:
     """Return cron slots strictly greater than ``last_fired_slot`` and <= ``now``.
@@ -336,10 +337,13 @@ def apply_on_missed_policy(
     Returns ``(slots_to_fire, bounded_dropped_count)``.
 
     Policies:
-        - ``skip``     : fire only the most recent slot, drop the rest
-                         (no backfill). ``bounded_dropped_count`` is 0
-                         because "skip" is policy-intended drop, not
-                         bound exceeded.
+        - ``skip``     : return ([], 0) — missed slots are intentionally
+                         dropped. ``evaluate_template`` handles the skip
+                         policy inline: it fires only the next *forward*
+                         slot (the one whose cron time has now passed),
+                         not any missed historical slots. ``apply_on_missed_policy``
+                         is not the place to emit that forward slot; the
+                         caller handles it outside this function.
         - ``run_once`` : fire the single most-recent missed slot.
         - ``run_all``  : fire up to ``cap`` oldest slots; anything beyond
                          counts as ``bounded_dropped_count``.
@@ -479,7 +483,7 @@ def _latest_watermark_by_slot(
 
 def _last_fired_cron_slot(
     latest_by_slot: dict[str, Watermark],
-) -> Optional[datetime]:
+) -> datetime | None:
     """Return the most recent terminal cron slot (for use as the walk anchor).
 
     Trigger-Now slots (``trigger:`` prefix) are excluded — they don't
@@ -487,7 +491,7 @@ def _last_fired_cron_slot(
     ``skipped_bounded``) DO advance it, otherwise ``run_all`` catch-up
     would re-propose the same dropped slots forever.
     """
-    latest: Optional[datetime] = None
+    latest: datetime | None = None
     for slot, wm in latest_by_slot.items():
         if slot.startswith("trigger:"):
             continue
@@ -499,7 +503,7 @@ def _last_fired_cron_slot(
     return latest
 
 
-def _parse_canonical_slot(slot: str) -> Optional[datetime]:
+def _parse_canonical_slot(slot: str) -> datetime | None:
     """Parse a canonical slot string back to UTC datetime. None on failure."""
     if slot.startswith("trigger:"):
         slot = slot[len("trigger:") :]
@@ -515,7 +519,7 @@ def _parse_canonical_slot(slot: str) -> Optional[datetime]:
     return dt.astimezone(timezone.utc).replace(microsecond=0)
 
 
-def _slot_has_terminal_watermark(wm: Optional[Watermark]) -> bool:
+def _slot_has_terminal_watermark(wm: Watermark | None) -> bool:
     """True if the watermark is in a terminal state (no re-fire)."""
     if wm is None:
         return False

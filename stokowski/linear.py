@@ -99,13 +99,17 @@ mutation($issueId: String!, $body: String!) {
 """
 
 COMMENTS_QUERY = """
-query($issueId: String!) {
+query($issueId: String!, $after: String) {
   issue(id: $issueId) {
-    comments(orderBy: createdAt) {
+    comments(first: 100, orderBy: createdAt, after: $after) {
       nodes {
         id
         body
         createdAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
       }
     }
   }
@@ -403,6 +407,23 @@ class LinearClient:
             },
             timeout=self.timeout,
         )
+        # P2-05: Cache team workflow states so update_issue_state doesn't
+        # re-fetch the full state list on every call. Never invalidated
+        # (Linear state names are stable during a process lifetime).
+        # Structure: team_id -> {state_name_lower: state_id}
+        self._team_states_cache: dict[str, dict[str, str]] = {}
+
+    def invalidate_team_states(self, team_id: str | None = None) -> None:
+        """Invalidate the team-states cache.
+
+        Passing ``team_id=None`` clears all teams; passing a specific ID
+        clears only that team. Exposed for completeness — the cache is
+        normally never invalidated during a process lifetime.
+        """
+        if team_id is None:
+            self._team_states_cache.clear()
+        else:
+            self._team_states_cache.pop(team_id, None)
 
     async def close(self):
         await self._client.aclose()
@@ -520,19 +541,43 @@ class LinearClient:
             return False
 
     async def fetch_comments(self, issue_id: str) -> list[dict]:
-        """Fetch all comments on a Linear issue. Returns list of {id, body, createdAt}."""
+        """Fetch all comments on a Linear issue, paginating as needed.
+
+        Returns list of {id, body, createdAt}. Paginates via ``pageInfo``
+        until ``hasNextPage`` is False or no further cursor is returned.
+        P1-08: Added ``first: 100`` and ``pageInfo`` to COMMENTS_QUERY.
+        """
+        all_nodes: list[dict] = []
+        cursor: str | None = None
         try:
-            data = await self._graphql(COMMENTS_QUERY, {"issueId": issue_id})
-            issue = data.get("issue", {})
-            return issue.get("comments", {}).get("nodes", [])
+            while True:
+                variables: dict = {"issueId": issue_id}
+                if cursor:
+                    variables["after"] = cursor
+                data = await self._graphql(COMMENTS_QUERY, variables)
+                comments = data.get("issue", {}).get("comments", {})
+                nodes = comments.get("nodes", []) or []
+                all_nodes.extend(nodes)
+                page_info = comments.get("pageInfo", {}) or {}
+                if not page_info.get("hasNextPage"):
+                    break
+                cursor = page_info.get("endCursor")
+                if not cursor:
+                    break
         except Exception as e:
             logger.error(f"Failed to fetch comments for {issue_id}: {e}")
-            return []
+            return all_nodes  # return what we have so far
+        return all_nodes
 
     async def update_issue_state(self, issue_id: str, state_name: str) -> bool:
-        """Move an issue to a new state by name. Returns True on success."""
+        """Move an issue to a new state by name. Returns True on success.
+
+        P2-05: Team states are cached per team_id on first call so subsequent
+        calls skip the ISSUE_TEAM_AND_STATES_QUERY round-trip. The cache is
+        never invalidated (state names are stable during a process lifetime).
+        """
         try:
-            # Get team and its workflow states in one query
+            # Fetch the team for this issue (lightweight — issue_id → team_id).
             data = await self._graphql(
                 ISSUE_TEAM_AND_STATES_QUERY, {"issueId": issue_id}
             )
@@ -541,17 +586,24 @@ class LinearClient:
                 logger.error(f"Could not find team for issue {issue_id}")
                 return False
 
-            states = team.get("states", {}).get("nodes", [])
-            state_id = None
-            for s in states:
-                if s.get("name", "").strip().lower() == state_name.strip().lower():
-                    state_id = s["id"]
-                    break
+            team_id = team.get("id", "")
+            state_name_lower = state_name.strip().lower()
+
+            # Check the cache first; populate lazily on miss.
+            if team_id not in self._team_states_cache:
+                raw_states = team.get("states", {}).get("nodes", []) or []
+                self._team_states_cache[team_id] = {
+                    s["name"].strip().lower(): s["id"]
+                    for s in raw_states
+                    if s.get("name") and s.get("id")
+                }
+
+            state_id = self._team_states_cache[team_id].get(state_name_lower)
 
             if not state_id:
                 logger.error(
                     f"State '{state_name}' not found. "
-                    f"Available: {[s.get('name') for s in states]}"
+                    f"Available: {list(self._team_states_cache[team_id].keys())}"
                 )
                 return False
 

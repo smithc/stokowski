@@ -366,7 +366,7 @@ schedules:
 schedules:
   compound-refresh:
     workflow: standard
-    overlap_policy: queue
+    overlap_policy: skip
     workspace_mode: persistent
     on_missed: run_all
     run_all_cap: 3
@@ -379,3 +379,17 @@ schedules:
         assert schedule_errors == [], (
             f"Expected no schedule errors, got {schedule_errors}"
         )
+
+    def test_queue_overlap_policy_is_rejected(self, tmp_path):
+        """P1-06: queue is reserved but unimplemented — must be rejected."""
+        path = _write_yaml(tmp_path, _BASE_YAML + """
+schedules:
+  compound-refresh:
+    workflow: standard
+    overlap_policy: queue
+""")
+        cfg = parse_workflow_file(path).config
+        errors = validate_config(cfg)
+        assert any(
+            "queue" in e and "not yet implemented" in e for e in errors
+        ), f"Expected queue rejection error, got {errors}"

@@ -104,7 +104,8 @@ class TestSnapshotShape:
         assert rm["backlog_detected"] is False
         assert rm["poison_pill_count"] == 0
         assert rm["last_archive_at"] is None
-        assert rm["pending_archive_count"] == 0
+        # pending_archive_count removed (P3-03)
+        assert "pending_archive_count" not in rm
 
     def test_keys_exist_when_schedules_configured_but_no_templates_yet(
         self, tmp_path
@@ -142,7 +143,8 @@ class TestScheduledTemplate:
         assert entry["next_fire_at"] == next_fire.isoformat()
         assert entry["last_fire_at"] is None
         assert entry["children_active"] == 0
-        assert entry["children_terminal_pending_retention"] == 0
+        # children_terminal_pending_retention removed (P3-03)
+        assert "children_terminal_pending_retention" not in entry
         assert entry["error_reason"] is None
         assert entry["error_since"] is None
         # Error-aggregate list stays empty
