@@ -349,3 +349,155 @@ class TestReconciliationClassification:
             review_state="Human Review",
         )
         assert action == "terminal"
+
+
+# ---------------------------------------------------------------------------
+# Template state cleanup symmetry (Unit 5: C4 / CLAUDE.md learning #1)
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateStateCleanup:
+    """Verify that per-template tracking dicts added in __init__ are all
+    mirrored in _cleanup_template_state(), and that _cleanup_issue_state()
+    correctly unthreads a scheduled-job child from its template's set via
+    the reverse index.
+    """
+
+    def _make_orch(self, tmp_path):
+        from stokowski.orchestrator import Orchestrator
+
+        wf_path = tmp_path / "workflow.yaml"
+        wf_path.write_text("""
+tracker:
+  api_key: test-key
+  project_slug: abc123
+
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  default:
+    default: true
+    path: [plan, done]
+""")
+        orch = Orchestrator(str(wf_path))
+        errors = orch._load_workflow()
+        assert not errors, f"Config errors: {errors}"
+        return orch
+
+    @staticmethod
+    def _populate_template(orch, template_id: str = "tmpl-1") -> None:
+        """Fill every per-template dict with a plausible entry for this template."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        orch._templates.add(template_id)
+        orch._template_snapshots[template_id] = Issue(
+            id=template_id, identifier="CFG-1", title="A template"
+        )
+        orch._template_children[template_id] = {"child-a", "child-b"}
+        orch._template_last_fired[template_id] = now
+        orch._template_last_seen[template_id] = 2
+        orch._template_error_since[template_id] = now
+        orch._template_watermark_seq[template_id] = 7
+        orch._template_next_fire_at[template_id] = now
+        orch._template_fire_attempts[(template_id, "2026-04-19T12:00:00Z")] = 1
+        orch._template_fire_attempts[(template_id, "2026-04-19T13:00:00Z")] = 2
+
+    def test_cleanup_clears_every_template_keyed_dict(self, tmp_path):
+        """Every dict keyed by template_id is empty after cleanup."""
+        orch = self._make_orch(tmp_path)
+        self._populate_template(orch, "tmpl-1")
+
+        asyncio.run(orch._cleanup_template_state("tmpl-1"))
+
+        assert "tmpl-1" not in orch._templates
+        assert "tmpl-1" not in orch._template_snapshots
+        assert "tmpl-1" not in orch._template_children
+        assert "tmpl-1" not in orch._template_last_fired
+        assert "tmpl-1" not in orch._template_last_seen
+        assert "tmpl-1" not in orch._template_error_since
+        assert "tmpl-1" not in orch._template_watermark_seq
+        assert "tmpl-1" not in orch._template_next_fire_at
+        # Per-slot attempt keys (tuple-keyed) are gone too.
+        assert all(k[0] != "tmpl-1" for k in orch._template_fire_attempts)
+
+    def test_cleanup_is_idempotent(self, tmp_path):
+        """Calling cleanup twice does not raise."""
+        orch = self._make_orch(tmp_path)
+        self._populate_template(orch, "tmpl-1")
+
+        asyncio.run(orch._cleanup_template_state("tmpl-1"))
+        # Second call must be a no-op, not an error.
+        asyncio.run(orch._cleanup_template_state("tmpl-1"))
+
+    def test_cleanup_missing_template_safe(self, tmp_path):
+        """Cleaning up an unknown template_id is safe."""
+        orch = self._make_orch(tmp_path)
+        asyncio.run(orch._cleanup_template_state("never-existed"))
+
+    def test_cleanup_preserves_other_templates(self, tmp_path):
+        """Cleanup of one template does not touch a sibling template's state."""
+        orch = self._make_orch(tmp_path)
+        self._populate_template(orch, "tmpl-1")
+        self._populate_template(orch, "tmpl-2")
+
+        asyncio.run(orch._cleanup_template_state("tmpl-1"))
+
+        assert "tmpl-2" in orch._templates
+        assert "tmpl-2" in orch._template_snapshots
+        assert "tmpl-2" in orch._template_children
+        assert "tmpl-2" in orch._template_last_fired
+        assert "tmpl-2" in orch._template_watermark_seq
+        assert any(k[0] == "tmpl-2" for k in orch._template_fire_attempts)
+
+    def test_child_cleanup_removes_from_template_children(self, tmp_path):
+        """_cleanup_issue_state on a scheduled-job child updates the template's set."""
+        orch = self._make_orch(tmp_path)
+        orch._templates.add("tmpl-1")
+        orch._template_children["tmpl-1"] = {"child-a", "child-b"}
+        orch._child_to_template["child-a"] = "tmpl-1"
+        orch._child_to_template["child-b"] = "tmpl-1"
+
+        orch._cleanup_issue_state("child-a")
+
+        # Reverse index entry removed
+        assert "child-a" not in orch._child_to_template
+        # Template's children set no longer contains the removed child
+        assert "child-a" not in orch._template_children["tmpl-1"]
+        # Sibling child still tracked
+        assert "child-b" in orch._template_children["tmpl-1"]
+        assert orch._child_to_template["child-b"] == "tmpl-1"
+
+    def test_child_cleanup_non_child_is_noop(self, tmp_path):
+        """_cleanup_issue_state on a regular (non-scheduled-job) issue does not
+        touch template tracking."""
+        orch = self._make_orch(tmp_path)
+        orch._templates.add("tmpl-1")
+        orch._template_children["tmpl-1"] = {"child-a"}
+        orch._child_to_template["child-a"] = "tmpl-1"
+
+        # "regular-issue" is not in the reverse index.
+        orch._cleanup_issue_state("regular-issue")
+
+        # Template state is untouched.
+        assert orch._template_children["tmpl-1"] == {"child-a"}
+        assert orch._child_to_template == {"child-a": "tmpl-1"}
+
+    def test_child_cleanup_stale_template_set_safe(self, tmp_path):
+        """If the reverse index points to a template whose children set was
+        already cleaned up (e.g., template hard-delete raced with child
+        terminal), cleanup does not raise."""
+        orch = self._make_orch(tmp_path)
+        orch._child_to_template["orphan-child"] = "tmpl-gone"
+        # No matching entry in _template_children on purpose.
+
+        # Must not raise.
+        orch._cleanup_issue_state("orphan-child")
+
+        assert "orphan-child" not in orch._child_to_template

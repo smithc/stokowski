@@ -224,6 +224,20 @@ class Orchestrator:
         # (which is correct: no prior tick to compare against).
         self._prev_issue_labels: dict[str, list[str]] = {}
 
+        # Per-template state (scheduled-jobs feature).
+        # Any NEW per-template dict added here MUST be mirrored in
+        # _cleanup_template_state() below (see CLAUDE.md learning #1).
+        self._templates: set[str] = set()                                 # template Linear issue IDs
+        self._template_snapshots: dict[str, Issue] = {}                   # template_id -> Issue (latest fetch)
+        self._template_children: dict[str, set[str]] = {}                 # template_id -> set of active child issue IDs
+        self._child_to_template: dict[str, str] = {}                      # child_id -> template_id (reverse index)
+        self._template_last_fired: dict[str, datetime] = {}               # template_id -> last successful fire timestamp
+        self._template_last_seen: dict[str, int] = {}                     # template_id -> N-tick-absent counter (Unit 8)
+        self._template_error_since: dict[str, datetime] = {}              # template_id -> when moved to Error state
+        self._template_watermark_seq: dict[str, int] = {}                 # template_id -> next seq counter value
+        self._template_fire_attempts: dict[tuple[str, str], int] = {}     # (template_id, slot) -> attempt counter
+        self._template_next_fire_at: dict[str, datetime] = {}             # template_id -> computed next-fire time (dashboard, Unit 13)
+
     @property
     def cfg(self) -> ServiceConfig:
         """Transitional shim: returns the primary (first-loaded) project cfg.
@@ -535,6 +549,38 @@ class Orchestrator:
         self.running.pop(issue_id, None)
         self._tasks.pop(issue_id, None)
         self.claimed.discard(issue_id)
+        # -- Scheduled-jobs child reverse-index --
+        # If this issue is a scheduled-job child, remove it from its template's
+        # index. Idempotent: pop returns None if not a child.
+        template_id = self._child_to_template.pop(issue_id, None)
+        if template_id:
+            children = self._template_children.get(template_id)
+            if children is not None:
+                children.discard(issue_id)
+
+    async def _cleanup_template_state(self, template_id: str) -> None:
+        """Idempotent cleanup of all per-template tracking state.
+
+        Called on template hard-delete detection (Unit 8 completes the
+        cascade-cancel of in-flight children). Any new per-template dict
+        added to ``__init__`` MUST be mirrored here.
+        """
+        self._templates.discard(template_id)
+        self._template_snapshots.pop(template_id, None)
+        self._template_children.pop(template_id, None)
+        self._template_last_fired.pop(template_id, None)
+        self._template_last_seen.pop(template_id, None)
+        self._template_error_since.pop(template_id, None)
+        self._template_watermark_seq.pop(template_id, None)
+        self._template_next_fire_at.pop(template_id, None)
+        # Per-slot fire-attempt entries are keyed by (template_id, slot).
+        for key in list(self._template_fire_attempts):
+            if key[0] == template_id:
+                self._template_fire_attempts.pop(key, None)
+        # Note: _child_to_template entries for this template's children are
+        # removed when those children terminal-transition via
+        # _cleanup_issue_state. Unit 8 extends this to cascade-cancel
+        # in-flight children.
 
     def _fire_and_forget(self, coro) -> None:
         """Schedule a coroutine without awaiting it. Prevents GC of the task."""
@@ -1480,6 +1526,37 @@ class Orchestrator:
                         exc_info=True,
                     )
 
+    async def _fetch_templates(self) -> None:
+        """Populate ``self._templates`` and ``self._template_snapshots`` from Linear.
+
+        Runs early in ``_tick`` BEFORE ``_reconcile`` so that reconcile's
+        R21 hard-delete detection (Unit 8) operates on a fresh template set.
+
+        On transient fetch failure, the existing snapshots are left untouched
+        so reconcile does not misinterpret a single Linear hiccup as a mass
+        hard-delete. On clean "no schedules configured" the snapshots are
+        cleared so stale entries don't leak after a config edit.
+        """
+        if not self.cfg.schedules:
+            # No schedule types configured — nothing to fetch.
+            self._templates.clear()
+            self._template_snapshots.clear()
+            return
+
+        schedule_state_names = self.cfg.schedule_template_linear_states()
+        try:
+            client = self._ensure_linear_client()
+            templates = await client.fetch_template_issues(
+                project_slug=self.cfg.tracker.project_slug,
+                schedule_state_names=schedule_state_names,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch templates: {e}", exc_info=True)
+            return  # leave existing state untouched on transient failure
+
+        self._templates = {t.id for t in templates}
+        self._template_snapshots = {t.id: t for t in templates}
+
     async def _tick(self):
         """Single poll tick: reconcile, validate, fetch, dispatch.
 
@@ -1492,6 +1569,10 @@ class Orchestrator:
         if errors_by_slug:
             for slug, errs in errors_by_slug.items():
                 logger.warning(f"Config invalid ({slug}): {errs}")
+
+        # Fetch templates BEFORE reconcile so hard-delete detection (Unit 8)
+        # sees the fresh set. See the plan's "Key Technical Decisions".
+        await self._fetch_templates()
 
         # Part 1: Reconcile running issues
         await self._reconcile()
@@ -1830,6 +1911,15 @@ class Orchestrator:
 
     def _is_eligible(self, issue: Issue) -> bool:
         """Check if an issue is eligible for dispatch."""
+        # Templates are never dispatched — they are configuration rows, not
+        # work items. This is defense-in-depth (R4): templates normally live
+        # in reserved states outside active_linear_states() so they don't
+        # reach this check, but a mis-mapped config must not leak one into
+        # the dispatch path.
+        for label in (issue.labels or []):
+            if label.lower().startswith("schedule:"):
+                return False
+
         if not issue.id or not issue.identifier or not issue.title or not issue.state:
             return False
 

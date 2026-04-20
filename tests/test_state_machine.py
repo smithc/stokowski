@@ -1889,3 +1889,108 @@ workflows:
         # No label match and no workflow field → default workflow
         assert wf.name == "triage"
         assert wf.default is True
+
+
+# ---------------------------------------------------------------------------
+# Schedule template dispatch exclusion (Unit 5: R4)
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleTemplateExclusion:
+    """Verify that templates (issues carrying a ``schedule:*`` label) are
+    never considered dispatch-eligible, regardless of their Linear state.
+
+    Templates normally live in reserved schedule states outside the active
+    set, but this is defense-in-depth per the plan's R4 requirement: a
+    mis-mapped config must not leak a template into the dispatch path.
+    """
+
+    @staticmethod
+    def _make_issue(labels=None, **kwargs):
+        defaults = dict(
+            id="tmpl-id",
+            identifier="TEST-42",
+            title="Daily compound refresh template",
+            state="In Progress",  # an ACTIVE state, to prove label-check wins
+        )
+        defaults.update(kwargs)
+        issue = Issue(**defaults)
+        if labels is not None:
+            issue.labels = labels
+        return issue
+
+    def _make_orch(self, tmp_path):
+        """Minimal orchestrator. Reuses the same config shape as the routing tests."""
+        from stokowski.orchestrator import Orchestrator
+
+        wf_path = tmp_path / "workflow.yaml"
+        wf_path.write_text("""
+tracker:
+  api_key: test-key
+  project_slug: abc123
+
+linear_states:
+  active: "In Progress"
+
+states:
+  plan:
+    type: agent
+    prompt: prompts/plan.md
+  done:
+    type: terminal
+    linear_state: terminal
+
+workflows:
+  default:
+    default: true
+    path: [plan, done]
+""")
+        orch = Orchestrator(str(wf_path))
+        errors = orch._load_workflow()
+        assert not errors, f"Config errors: {errors}"
+        return orch
+
+    def test_schedule_label_excludes_issue(self, tmp_path):
+        """Issue carrying a ``schedule:foo`` label is never eligible."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["schedule:compound-refresh"])
+        assert orch._is_eligible(issue) is False
+
+    def test_schedule_label_case_insensitive(self, tmp_path):
+        """Label matching is case-insensitive on the ``schedule:`` prefix."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["Schedule:Compound-Refresh"])
+        assert orch._is_eligible(issue) is False
+
+    def test_schedule_wins_over_workflow_label(self, tmp_path):
+        """An issue with BOTH ``schedule:*`` AND ``workflow:*`` labels is still excluded."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(
+            labels=["schedule:nightly", "workflow:quick-fix"]
+        )
+        assert orch._is_eligible(issue) is False
+
+    def test_non_schedule_label_not_excluded(self, tmp_path):
+        """Label that merely starts with ``schedul`` (no colon) is NOT a template."""
+        orch = self._make_orch(tmp_path)
+        # "scheduler-team" is just a team tag — missing colon.
+        issue = self._make_issue(labels=["scheduler-team"])
+        # Should NOT be excluded by the template guard (may still fail other
+        # checks but not this one).
+        assert orch._is_eligible(issue) is True
+
+    def test_no_labels_not_excluded(self, tmp_path):
+        """Issue with no labels passes the template guard."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=[])
+        assert orch._is_eligible(issue) is True
+
+    def test_template_in_active_state_still_excluded(self, tmp_path):
+        """Defense-in-depth: a template leaked into the active state via a
+        mis-mapped config is still rejected by the label check."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(
+            labels=["schedule:compound-refresh"],
+            state="In Progress",  # active — would normally be dispatchable
+        )
+        assert orch._is_eligible(issue) is False
