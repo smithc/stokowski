@@ -287,6 +287,40 @@ def compute_missed_slots(
     return slots
 
 
+def next_fire_time(
+    cron_expr: str,
+    tz_name: str,
+    now: datetime,
+) -> datetime:
+    """Return the next time the cron fires strictly after ``now``, in UTC.
+
+    Pure helper used by the orchestrator to cache ``_template_next_fire_at``
+    once per tick for the dashboard snapshot. Raises
+    :class:`CronParseError` / :class:`TimezoneError` on invalid inputs —
+    callers catch these to drive the R18 "move template to Error" flow.
+    """
+    _, tz = parse_cron_and_tz(cron_expr, tz_name)
+
+    now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(
+        tzinfo=timezone.utc
+    )
+    anchor = now_utc.astimezone(tz)
+
+    from croniter import croniter  # type: ignore
+
+    try:
+        itr = croniter(cron_expr, anchor)
+    except Exception as exc:
+        raise CronParseError(
+            f"invalid cron expression {cron_expr!r}: {exc}"
+        ) from exc
+
+    next_dt = itr.get_next(datetime)
+    if next_dt.tzinfo is None:
+        next_dt = next_dt.replace(tzinfo=tz)
+    return next_dt.astimezone(timezone.utc).replace(microsecond=0)
+
+
 # ---------------------------------------------------------------------------
 # on_missed policies
 # ---------------------------------------------------------------------------
@@ -684,6 +718,7 @@ __all__ = [
     "detect_trigger_now",
     "detect_error",
     "parse_cron_and_tz",
+    "next_fire_time",
     "compute_missed_slots",
     "apply_on_missed_policy",
     "detect_duplicate_label",

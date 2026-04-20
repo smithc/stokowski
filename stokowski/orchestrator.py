@@ -408,6 +408,7 @@ class Orchestrator:
         self._template_watermark_seq: dict[str, int] = {}                 # template_id -> next seq counter value
         self._template_fire_attempts: dict[tuple[str, str], int] = {}     # (template_id, slot) -> attempt counter
         self._template_next_fire_at: dict[str, datetime] = {}             # template_id -> computed next-fire time (dashboard, Unit 13)
+        self._template_error_reasons: dict[str, str] = {}                 # template_id -> latest schedule_error reason (dashboard, Unit 13)
         self._template_seq_seeded: set[str] = set()                       # template_ids whose seq counter was rehydrated from Linear this process lifetime
 
         # Retention sweep state (Unit 10, R13). Not keyed by template —
@@ -912,6 +913,7 @@ class Orchestrator:
         self._template_error_since.pop(template_id, None)
         self._template_watermark_seq.pop(template_id, None)
         self._template_next_fire_at.pop(template_id, None)
+        self._template_error_reasons.pop(template_id, None)
         self._template_seq_seeded.discard(template_id)
         # Per-slot fire-attempt entries are keyed by (template_id, slot).
         for key in list(self._template_fire_attempts):
@@ -2318,7 +2320,25 @@ class Orchestrator:
                         f"expression or timezone custom field"
                     ),
                 )
+                self._template_next_fire_at.pop(template_id, None)
                 continue
+
+            # Cache next-fire-at for the dashboard (Unit 13). Done here
+            # so the snapshot path is a cheap dict read — no per-call
+            # croniter evaluation for each dashboard tab. Parse failures
+            # surface via the evaluator below; drop the stale cache now.
+            try:
+                self._template_next_fire_at[template_id] = (
+                    scheduler.next_fire_time(snap.cron_expr, snap.timezone, now)
+                )
+            except (scheduler.CronParseError, scheduler.TimezoneError):
+                self._template_next_fire_at.pop(template_id, None)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(
+                    f"next_fire_time computation failed for "
+                    f"{template.identifier}: {e}"
+                )
+                self._template_next_fire_at.pop(template_id, None)
 
             # One-shot seq seeding + comment fetch. We fetch comments
             # every tick here — the watermark scan needs them anyway.
@@ -3070,6 +3090,9 @@ class Orchestrator:
             # dashboard's "Error > 24h" metric.
             if template.id not in self._template_error_since or not same_reason:
                 self._template_error_since[template.id] = datetime.now(timezone.utc)
+            # Cache the reason so the dashboard (Unit 13) can surface it
+            # without re-reading Linear on every snapshot poll.
+            self._template_error_reasons[template.id] = reason
 
             # Log at ERROR on first entry / reason change; DEBUG on repeats
             # (operator already saw the first one, no need to spam stderr).
@@ -3112,6 +3135,7 @@ class Orchestrator:
             current = (tmpl.state or "").strip().lower()
             if current != error_state_lower:
                 self._template_error_since.pop(tmpl_id, None)
+                self._template_error_reasons.pop(tmpl_id, None)
 
     async def _retention_sweep(self) -> None:
         """R13: budget-bounded archive of old terminal children.
@@ -4527,6 +4551,9 @@ class Orchestrator:
             if r.started_at
         )
 
+        schedules, schedule_errors = self._build_schedule_snapshot(now)
+        retention_metrics = self._build_retention_metrics(schedule_errors, now)
+
         return {
             "generated_at": now.isoformat(),
             "counts": {
@@ -4588,6 +4615,133 @@ class Orchestrator:
                     self.total_seconds_running + active_seconds, 1
                 ),
             },
+            "schedules": schedules,
+            "schedule_errors": schedule_errors,
+            "retention_metrics": retention_metrics,
+        }
+
+    # --- Scheduled-jobs snapshot helpers (Unit 13) -----------------------
+
+    def _build_schedule_snapshot(
+        self, now: datetime
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return (schedules, schedule_errors) for ``get_state_snapshot()``.
+
+        Pure dict composition over existing tracking dicts. ``next_fire_at``
+        is a *cached* value (populated per-tick in ``_evaluate_schedules``)
+        to avoid burning CPU on per-snapshot croniter calls when multiple
+        dashboard tabs poll ``/api/v1/state``.
+
+        ``children_terminal_pending_retention`` is intentionally 0 for the
+        MVP — no per-template terminal-but-not-archived counter exists yet
+        (would require scanning children on every tick). The dashboard
+        renders it as "—" until a future unit adds the counter.
+        """
+        schedules: list[dict[str, Any]] = []
+        schedule_errors: list[dict[str, Any]] = []
+
+        error_state_lower = (
+            self.cfg.linear_states.schedule_error or ""
+        ).strip().lower()
+
+        for template_id, template in self._template_snapshots.items():
+            schedule_cfg = self._resolve_schedule_config(template)
+            schedule_type = self._resolve_schedule_name(template)
+            tz_name = template.timezone or (
+                schedule_cfg.timezone if schedule_cfg else None
+            )
+
+            children = self._template_children.get(template_id, set())
+            children_active = sum(1 for cid in children if cid in self.running)
+
+            next_fire_dt = self._template_next_fire_at.get(template_id)
+            last_fire_dt = self._template_last_fired.get(template_id)
+            error_since_dt = self._template_error_since.get(template_id)
+
+            state_name = template.state or ""
+            is_error = (
+                state_name.strip().lower() == error_state_lower
+                and error_state_lower != ""
+            )
+
+            error_reason: str | None = None
+            if is_error or error_since_dt is not None:
+                # Try to read the most recent schedule_error cache if we
+                # have one; otherwise surface "unknown". We intentionally
+                # do NOT hit Linear from the snapshot path — this runs
+                # behind the dashboard's 3-second poll.
+                error_reason = self._template_error_reasons.get(
+                    template_id, "unknown"
+                )
+
+            schedules.append({
+                "template_id": template_id,
+                "identifier": template.identifier,
+                "title": template.title,
+                "schedule_type": schedule_type,
+                "state": state_name,
+                "cron": template.cron_expr,
+                "timezone": tz_name,
+                "next_fire_at": (
+                    next_fire_dt.isoformat() if next_fire_dt else None
+                ),
+                "last_fire_at": (
+                    last_fire_dt.isoformat() if last_fire_dt else None
+                ),
+                "children_active": children_active,
+                # TODO(unit-future): track per-template terminal-but-not-
+                # yet-archived children to populate this. Dashboard renders
+                # 0 / "—" today.
+                "children_terminal_pending_retention": 0,
+                "error_reason": error_reason,
+                "error_since": (
+                    error_since_dt.isoformat() if error_since_dt else None
+                ),
+            })
+
+            if error_since_dt is not None:
+                age_hours = max(
+                    0.0, (now - error_since_dt).total_seconds() / 3600.0
+                )
+                schedule_errors.append({
+                    "template_id": template_id,
+                    "identifier": template.identifier,
+                    "reason": error_reason or "unknown",
+                    "since": error_since_dt.isoformat(),
+                    "age_hours": round(age_hours, 2),
+                })
+
+        return schedules, schedule_errors
+
+    def _build_retention_metrics(
+        self,
+        schedule_errors: list[dict[str, Any]],
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Return the ``retention_metrics`` block for the snapshot.
+
+        Aggregates a few state flags / counts the dashboard surfaces:
+        backlog detection, poison-pill counts, and the "Templates in
+        Error > 24h" stat card (R18 surface).
+        """
+        over_24h = sum(
+            1 for e in schedule_errors if e.get("age_hours", 0.0) >= 24.0
+        )
+
+        last_archive_at: datetime | None = None
+        if self._retention_last_archive_at:
+            last_archive_at = max(self._retention_last_archive_at.values())
+
+        return {
+            # TODO(unit-future): surface real pending-archive count — needs
+            # terminal-child scan beyond the scope of Unit 13.
+            "pending_archive_count": 0,
+            "backlog_detected": bool(self._retention_backlog_detected),
+            "poison_pill_count": len(self._retention_poison_pill_counts),
+            "last_archive_at": (
+                last_archive_at.isoformat() if last_archive_at else None
+            ),
+            "templates_in_error_over_24h": over_24h,
         }
 
 

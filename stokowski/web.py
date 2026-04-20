@@ -140,7 +140,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   /* ── Metrics row ── */
   .metrics {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     gap: 1px;
     background: var(--border);
     border: 1px solid var(--border);
@@ -344,6 +344,112 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-weight: 300;
   }
 
+  /* ── Schedules panel ── */
+  .schedules {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    margin-bottom: 32px;
+  }
+
+  .schedule-row {
+    background: var(--surface);
+    padding: 14px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: background 0.15s;
+  }
+
+  .schedule-row:hover {
+    background: #141414;
+  }
+
+  .schedule-main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .schedule-row .identifier {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--amber);
+    letter-spacing: 0.02em;
+  }
+
+  .schedule-type {
+    font-size: 11px;
+    color: var(--text);
+    background: rgba(232, 184, 75, 0.08);
+    border: 1px solid var(--amber-dim);
+    padding: 2px 8px;
+    border-radius: 2px;
+    letter-spacing: 0.04em;
+  }
+
+  .schedule-state {
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 2px;
+    border: 1px solid var(--border-hi);
+    color: var(--muted);
+  }
+
+  .schedule-state.state-scheduled {
+    color: var(--green);
+    background: rgba(76, 186, 110, 0.08);
+    border-color: rgba(76, 186, 110, 0.25);
+  }
+
+  .schedule-state.state-paused {
+    color: var(--muted);
+    background: transparent;
+    border-color: var(--border-hi);
+  }
+
+  .schedule-state.state-trigger-now {
+    color: var(--amber);
+    background: rgba(232, 184, 75, 0.12);
+    border-color: var(--amber-dim);
+  }
+
+  .schedule-state.state-error {
+    color: var(--red);
+    background: rgba(217, 95, 82, 0.1);
+    border-color: rgba(217, 95, 82, 0.35);
+  }
+
+  .schedule-row.state-error {
+    border-left: 2px solid var(--red);
+    padding-left: 18px;
+  }
+
+  .schedule-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 300;
+  }
+
+  .schedule-meta .cron {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .schedule-meta .schedule-error-reason {
+    color: var(--red);
+    font-weight: 500;
+  }
+
   /* ── Stats bar ── */
   .stats-bar {
     display: flex;
@@ -460,6 +566,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="metric-value" id="v-runtime">—</div>
       <div class="metric-sub">cumulative seconds</div>
     </div>
+    <div class="metric" id="m-errors">
+      <div class="metric-label">Error &gt; 24h</div>
+      <div class="metric-value" id="v-errors">—</div>
+      <div class="metric-sub">templates stuck</div>
+    </div>
   </div>
 
   <div class="section-header">
@@ -469,6 +580,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div id="agents-container"></div>
+
+  <div class="section-header">
+    <span class="section-title">Schedules</span>
+    <div class="section-line"></div>
+    <span class="section-count" id="schedules-count">0</span>
+  </div>
+
+  <div id="schedules-container"></div>
 
   <div class="stats-bar">
     <div class="stat-item">
@@ -578,6 +697,64 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       `<div class="agents">${rows}</div>`;
   }
 
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    try {
+      const d = new Date(iso);
+      const y = d.getUTCFullYear();
+      const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+      const day = String(d.getUTCDate()).padStart(2, '0');
+      const h = String(d.getUTCHours()).padStart(2, '0');
+      const mm = String(d.getUTCMinutes()).padStart(2, '0');
+      return `${y}-${m}-${day} ${h}:${mm} UTC`;
+    } catch(e) {
+      return iso;
+    }
+  }
+
+  function renderSchedules(data) {
+    const panel = document.getElementById('schedules-container');
+    const count = document.getElementById('schedules-count');
+    const schedules = data.schedules || [];
+    count.textContent = schedules.length;
+
+    if (schedules.length === 0) {
+      panel.innerHTML = `
+        <div class="empty">
+          <div class="empty-title">No scheduled jobs configured</div>
+          <div class="empty-sub">Add a schedule block to workflow.yaml and label a Linear issue schedule:&lt;name&gt;</div>
+        </div>`;
+      return;
+    }
+
+    const rows = schedules.map(s => {
+      const stateKey = String(s.state || '').toLowerCase().replace(/\\s+/g, '-') || 'unknown';
+      const cronText = s.cron
+        ? `${esc(s.cron)} (${esc(s.timezone || 'UTC')})`
+        : '—';
+      const errorLine = s.error_reason
+        ? `<span class="schedule-error-reason">Error: ${esc(s.error_reason)}</span>`
+        : '';
+      return `
+      <div class="schedule-row state-${esc(stateKey)}">
+        <div class="schedule-main">
+          <span class="identifier">${esc(s.identifier)}</span>
+          <span class="schedule-type">${esc(s.schedule_type || '—')}</span>
+          <span class="schedule-state state-${esc(stateKey)}">${esc(s.state || '—')}</span>
+        </div>
+        <div class="schedule-meta">
+          <span class="cron">${cronText}</span>
+          <span class="next-fire">Next: ${esc(fmtTime(s.next_fire_at))}</span>
+          <span class="last-fire">Last: ${esc(fmtTime(s.last_fire_at))}</span>
+          <span class="children-active">Active: ${s.children_active || 0}</span>
+          ${errorLine}
+        </div>
+      </div>`;
+    }).join('');
+
+    panel.innerHTML = `<div class="schedules">${rows}</div>`;
+  }
+
   async function refresh() {
     try {
       const res = await fetch('/api/v1/state');
@@ -617,6 +794,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         'last sync ' + now.toLocaleTimeString('en-US', { hour12: false });
 
       renderAgents(data);
+      renderSchedules(data);
+
+      // Error > 24h metric
+      const over24 = data.retention_metrics?.templates_in_error_over_24h || 0;
+      document.getElementById('v-errors').textContent = over24;
+      document.getElementById('m-errors').className =
+        'metric' + (over24 > 0 ? ' active' : '');
     } catch(e) {
       document.getElementById('status-dot').className = 'status-dot idle';
     }
