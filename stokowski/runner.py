@@ -64,6 +64,43 @@ def _prepare_docker_args(
     return docker_args, container_name, None, None
 
 
+def build_scope_restriction(
+    issue_identifier: str,
+    template_identifier: str | None = None,
+) -> str:
+    """Build the scope-restriction system prompt.
+
+    For regular issues, returns the base guardrail prohibiting writes to any
+    Linear issue other than the one being worked on.
+
+    For scheduled-job children (when ``template_identifier`` is set), extends
+    the guardrail with an explicit carve-out permitting comment writes on the
+    parent template for cross-fire status coordination (R25). Writes to any
+    OTHER Linear issue remain prohibited.
+
+    This is a probabilistic guardrail enforced by prompting, not by tool
+    permission (see CLAUDE.md "Agent scope guardrails").
+    """
+    base = (
+        f"Do NOT use Linear tools to modify, comment on, or transition any "
+        f"Linear issue other than {issue_identifier}. You may read other "
+        f"issues for context, but do not take any write action on them."
+    )
+    if template_identifier is None:
+        return base
+    carve_out = (
+        f"\n\nEXCEPTION for scheduled-job children: You MAY post comments on "
+        f"your parent template {template_identifier} for cross-fire status "
+        f"coordination (e.g., 'last run wrote 3 new entries to .context/'). "
+        f"You MUST NOT write to any OTHER Linear issue — only your own issue "
+        f"({issue_identifier}) and your parent template "
+        f"({template_identifier})."
+    )
+    return base + carve_out
+
+
+# Backwards-compatibility alias: legacy callers used a module-level constant
+# with a ``{issue_identifier}`` slot. Prefer ``build_scope_restriction()``.
 SCOPE_RESTRICTION_SYSTEM = (
     "Do NOT use Linear tools to modify, comment on, or transition any Linear issue "
     "other than {issue_identifier}. You may read other issues for context, but do "
@@ -77,8 +114,15 @@ def build_claude_args(
     workspace_path: Path,
     session_id: str | None = None,
     issue_identifier: str | None = None,
+    template_identifier: str | None = None,
 ) -> list[str]:
-    """Build the claude CLI argument list."""
+    """Build the claude CLI argument list.
+
+    When ``template_identifier`` is provided, the scope-restriction guardrail
+    is extended to permit comment writes to the parent template issue. This
+    is used for scheduled-job children so they can post cross-fire status
+    updates on their parent template.
+    """
     args = [claude_cfg.command]
 
     if session_id:
@@ -108,10 +152,13 @@ def build_claude_args(
             "You MAY use the Skill tool and Agent tool — when invoking skills, "
             "operate in pipeline mode and skip all interactive prompts."
         )
-        # Scope restriction guardrail — prohibit writing to other Linear issues
+        # Scope restriction guardrail — prohibit writing to other Linear issues.
+        # For scheduled-job children, extend with a carve-out permitting writes
+        # to the parent template (passed via template_identifier).
         if issue_identifier:
-            guardrail = SCOPE_RESTRICTION_SYSTEM.format(
-                issue_identifier=issue_identifier
+            guardrail = build_scope_restriction(
+                issue_identifier,
+                template_identifier=template_identifier,
             )
             headless_context = f"{headless_context}\n{guardrail}"
 
@@ -349,11 +396,18 @@ async def run_agent_turn(
     workspace_key: str = "",
     docker_image: str = "",
     log_path: Path | None = None,
+    template_identifier: str | None = None,
 ) -> RunAttempt:
-    """Run a single Claude Code turn. Returns updated RunAttempt."""
+    """Run a single Claude Code turn. Returns updated RunAttempt.
+
+    When ``template_identifier`` is provided, the scope-restriction guardrail
+    is extended to permit the agent to post comments on the parent scheduled
+    template for cross-fire status coordination.
+    """
     args = build_claude_args(
         claude_cfg, prompt, workspace_path, attempt.session_id,
         issue_identifier=issue.identifier,
+        template_identifier=template_identifier,
     )
 
     # Docker wrapping — Claude Code needs plugin config rewriting

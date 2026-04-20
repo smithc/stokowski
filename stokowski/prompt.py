@@ -206,6 +206,10 @@ def build_lifecycle_section(
     recent_comments: list[dict[str, Any]] | None = None,
     transitions: dict[str, str] | None = None,
     repo: RepoConfig | None = None,
+    *,
+    template_issue: Issue | None = None,
+    fire_slot: str | None = None,
+    previous_fires_count: int = 0,
 ) -> str:
     """Generate the auto-injected lifecycle section.
 
@@ -228,6 +232,15 @@ def build_lifecycle_section(
             ``**Repository:**`` line when the repo is not the synthetic
             ``_default`` legacy fallback. Omitted entirely for ``_default``
             to avoid noise in single-repo legacy configs.
+        template_issue: The parent template issue when this issue is a
+            scheduled-job child. When set, an extra "Scheduled fire context"
+            block is injected and the scope restriction is extended to
+            permit comment writes on the template.
+        fire_slot: Canonical slot identifier (ISO timestamp or tick number)
+            this fire belongs to. Only used when ``template_issue`` is set.
+        previous_fires_count: Number of successful fires of this template
+            completed before this fire. Only used when ``template_issue``
+            is set.
 
     Returns:
         A markdown string clearly demarcated as auto-generated.
@@ -253,15 +266,58 @@ def build_lifecycle_section(
     lines.append(f"- **Run:** {run}")
     lines.append("")
 
+    # Scheduled-fire context — only for children of a scheduled template
+    if template_issue is not None:
+        lines.append("<!-- stokowski:lifecycle:scheduled-fire -->")
+        lines.append("")
+        lines.append("### Scheduled Fire Context")
+        lines.append("")
+        lines.append(
+            f"This issue is a **fire of scheduled template "
+            f"{template_issue.identifier}**"
+            + (f" — {template_issue.title}" if template_issue.title else "")
+            + "."
+        )
+        if fire_slot:
+            lines.append(f"- **Slot:** {fire_slot}")
+        if previous_fires_count == 0:
+            lines.append("- **Previous successful fires:** 0 (this is the first fire)")
+        else:
+            lines.append(
+                f"- **Previous successful fires:** {previous_fires_count}"
+            )
+        if template_issue.url:
+            lines.append(f"- **Template URL:** {template_issue.url}")
+        lines.append("")
+        lines.append(
+            f"You MAY post status comments to your parent template "
+            f"{template_issue.identifier} for cross-fire coordination "
+            f"(e.g., noting what this run produced so the next fire can "
+            f"pick up where you left off). You MUST NOT write to any other "
+            f"Linear issue outside your own fire and your parent template."
+        )
+        lines.append("")
+
     # Scope restriction guardrail
     lines.append("### Scope Restriction")
     lines.append("")
-    lines.append(
-        f"You are scoped to issue {issue.identifier} ONLY. Do not modify, "
-        f"comment on, or transition any other Linear issue. You may read "
-        f"other issues for context (e.g., checking a blocker's status), "
-        f"but do not take any write action on them."
-    )
+    if template_issue is not None:
+        lines.append(
+            f"You are scoped to issue {issue.identifier} and your parent "
+            f"scheduled template {template_issue.identifier}. Do not modify, "
+            f"comment on, or transition any other Linear issue. You may read "
+            f"other issues for context (e.g., checking a blocker's status), "
+            f"but do not take any write action on them. Writing comments to "
+            f"the parent template {template_issue.identifier} is explicitly "
+            f"permitted for cross-fire coordination."
+        )
+    else:
+        lines.append(
+            f"You are scoped to issue {issue.identifier} ONLY. Do not modify, "
+            f"comment on, or transition any other Linear issue. You may read "
+            f"other issues for context (e.g., checking a blocker's status), "
+            f"but do not take any write action on them."
+        )
     lines.append("")
 
     # Rework information

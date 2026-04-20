@@ -422,6 +422,278 @@ class TestGuardrailPromptText:
 
 
 # ---------------------------------------------------------------------------
+# Scope carve-out for scheduled-job children (Unit 12 / R25)
+# ---------------------------------------------------------------------------
+
+
+class TestScopeCarveOut:
+    """Tests for build_scope_restriction() — the scheduled-job carve-out."""
+
+    def test_base_restriction_without_template(self):
+        from stokowski.runner import build_scope_restriction
+
+        text = build_scope_restriction("SMI-42")
+        assert "SMI-42" in text
+        assert "Do NOT" in text
+        assert "modify" in text.lower()
+        # No carve-out language when no template
+        assert "EXCEPTION" not in text
+        assert "parent template" not in text.lower()
+
+    def test_carve_out_with_template(self):
+        from stokowski.runner import build_scope_restriction
+
+        text = build_scope_restriction(
+            "SMI-201", template_identifier="SMI-88"
+        )
+        # Base prohibition still present
+        assert "SMI-201" in text
+        assert "Do NOT" in text
+        # Carve-out present
+        assert "EXCEPTION" in text
+        assert "SMI-88" in text
+        assert "parent template" in text.lower()
+        # Explicit "only your own and template" language
+        assert "MUST NOT write to any OTHER" in text
+
+    def test_carve_out_mentions_both_identifiers(self):
+        from stokowski.runner import build_scope_restriction
+
+        text = build_scope_restriction(
+            "CHILD-1", template_identifier="TMPL-9"
+        )
+        # Both appear; at least one reference each in the carve-out
+        assert text.count("CHILD-1") >= 1
+        assert text.count("TMPL-9") >= 2  # template mentioned multiple times
+
+    def test_none_template_regression_safety(self):
+        """Passing template_identifier=None must equal omitting it."""
+        from stokowski.runner import build_scope_restriction
+
+        a = build_scope_restriction("SMI-1")
+        b = build_scope_restriction("SMI-1", template_identifier=None)
+        assert a == b
+
+    def test_legacy_constant_still_exposed(self):
+        """SCOPE_RESTRICTION_SYSTEM constant must remain importable for
+        backwards compatibility with any external code."""
+        from stokowski.runner import SCOPE_RESTRICTION_SYSTEM
+
+        assert "{issue_identifier}" in SCOPE_RESTRICTION_SYSTEM
+
+    def test_system_prompt_includes_carve_out_when_template_passed(self):
+        """build_claude_args threads template_identifier into the system
+        prompt when provided."""
+        from pathlib import Path
+        from stokowski.config import ClaudeConfig
+        from stokowski.runner import build_claude_args
+
+        cfg = ClaudeConfig(command="claude")
+        args = build_claude_args(
+            cfg, "test prompt", Path("/tmp"),
+            session_id=None,
+            issue_identifier="CHILD-7",
+            template_identifier="TMPL-2",
+        )
+        idx = args.index("--append-system-prompt")
+        system_prompt = args[idx + 1]
+        assert "CHILD-7" in system_prompt
+        assert "TMPL-2" in system_prompt
+        assert "EXCEPTION" in system_prompt
+
+    def test_system_prompt_no_carve_out_without_template(self):
+        """Regression: existing callers that omit template_identifier get
+        the unchanged base guardrail."""
+        from pathlib import Path
+        from stokowski.config import ClaudeConfig
+        from stokowski.runner import build_claude_args
+
+        cfg = ClaudeConfig(command="claude")
+        args = build_claude_args(
+            cfg, "test prompt", Path("/tmp"),
+            session_id=None, issue_identifier="FOO-1",
+        )
+        idx = args.index("--append-system-prompt")
+        system_prompt = args[idx + 1]
+        assert "FOO-1" in system_prompt
+        assert "EXCEPTION" not in system_prompt
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle section for scheduled-job children (Unit 12 / R6)
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleForScheduled:
+    """Tests for build_lifecycle_section() scheduled-fire block."""
+
+    def _make_child(self):
+        from stokowski.models import Issue
+
+        return Issue(
+            id="child-id",
+            identifier="FIRE-1",
+            title="Daily digest fire",
+            url="https://linear.app/test/FIRE-1",
+        )
+
+    def _make_template(self):
+        from stokowski.models import Issue
+
+        return Issue(
+            id="tmpl-id",
+            identifier="TMPL-5",
+            title="Daily context digest",
+            url="https://linear.app/test/TMPL-5",
+        )
+
+    def test_no_scheduled_section_when_template_none(self):
+        """Regression: regular (non-scheduled) issues omit the scheduled block."""
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+        )
+        assert "Scheduled Fire Context" not in section
+        assert "stokowski:lifecycle:scheduled-fire" not in section
+        # Base scope restriction unchanged
+        assert "FIRE-1 ONLY" in section
+
+    def test_scheduled_section_injected_with_template(self):
+        """When template_issue is passed, the scheduled-fire block renders."""
+        state = StateConfig(
+            name="run",
+            transitions={"complete": "done"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="run",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            template_issue=self._make_template(),
+            fire_slot="2026-04-19T08:00:00Z",
+            previous_fires_count=6,
+        )
+        assert "Scheduled Fire Context" in section
+        assert "stokowski:lifecycle:scheduled-fire" in section
+        assert "TMPL-5" in section
+        assert "2026-04-19T08:00:00Z" in section
+        assert "6" in section
+        # Template URL included when present
+        assert "https://linear.app/test/TMPL-5" in section
+
+    def test_scheduled_section_first_fire_renders_cleanly(self):
+        """previous_fires_count=0 renders as 'first fire'."""
+        state = StateConfig(
+            name="run",
+            transitions={"complete": "done"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="run",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            template_issue=self._make_template(),
+            fire_slot="tick-1",
+            previous_fires_count=0,
+        )
+        assert "Scheduled Fire Context" in section
+        assert "first fire" in section.lower()
+
+    def test_scheduled_section_extends_scope_restriction(self):
+        """Scope restriction is rewritten to permit template comments."""
+        state = StateConfig(
+            name="run",
+            transitions={"complete": "done"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="run",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            template_issue=self._make_template(),
+            fire_slot="2026-04-19T08:00:00Z",
+            previous_fires_count=2,
+        )
+        # Regular "ONLY" language replaced
+        assert "FIRE-1 ONLY" not in section
+        # Parent template named in scope restriction
+        assert "TMPL-5" in section
+        # "permitted for cross-fire" phrasing
+        assert "cross-fire" in section.lower()
+
+    def test_scheduled_section_without_slot_still_renders(self):
+        """fire_slot is optional — section still renders without it."""
+        state = StateConfig(
+            name="run",
+            transitions={"complete": "done"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="run",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            template_issue=self._make_template(),
+            previous_fires_count=1,
+        )
+        assert "Scheduled Fire Context" in section
+        assert "TMPL-5" in section
+
+    def test_scheduled_section_mentions_template_coordination(self):
+        """Body must tell the agent they MAY post to the template."""
+        state = StateConfig(
+            name="run",
+            transitions={"complete": "done"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="run",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            template_issue=self._make_template(),
+            previous_fires_count=0,
+        )
+        # Must explicitly grant permission to post on template
+        lowered = section.lower()
+        assert "may post" in lowered
+        assert "tmpl-5" in lowered
+
+    def test_existing_callers_unaffected(self):
+        """Regression: existing callers that omit the new kwargs see no
+        change to lifecycle section output."""
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},
+        )
+        section_before = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            run=2,
+            is_rework=False,
+        )
+        # Re-rendered with explicit defaults should match
+        section_after = build_lifecycle_section(
+            issue=self._make_child(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            run=2,
+            is_rework=False,
+            template_issue=None,
+            fire_slot=None,
+            previous_fires_count=0,
+        )
+        assert section_before == section_after
+
+
+# ---------------------------------------------------------------------------
 # Workflow transition derivation
 # ---------------------------------------------------------------------------
 
