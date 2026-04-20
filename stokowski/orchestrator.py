@@ -582,6 +582,15 @@ class Orchestrator:
         cascade-cancel of in-flight children). Any new per-template dict
         added to ``__init__`` MUST be mirrored here.
         """
+        # Tear down any persistent workspace associated with this template
+        # BEFORE dropping the snapshot — the helper needs the snapshot to
+        # compute the workspace key.
+        try:
+            await self._remove_workspace_for_template(template_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to remove persistent workspace for template {template_id}: {e}"
+            )
         self._templates.discard(template_id)
         self._template_snapshots.pop(template_id, None)
         self._template_children.pop(template_id, None)
@@ -599,6 +608,97 @@ class Orchestrator:
         # removed when those children terminal-transition via
         # _cleanup_issue_state. Unit 8 extends this to cascade-cancel
         # in-flight children.
+
+    def _resolve_schedule_config_for_template(
+        self, template_id: str
+    ) -> "ScheduleConfig | None":  # noqa: F821 — forward ref
+        """Resolve the ScheduleConfig for a template by snapshot lookup.
+
+        Returns None if the template snapshot is missing or the template
+        carries no ``schedule:<name>`` label mapping to a configured
+        schedule. Safe to call when ``_template_snapshots`` is empty
+        (e.g. during startup before ``_fetch_templates`` has run).
+        """
+        template = self._template_snapshots.get(template_id)
+        if not template:
+            return None
+        return self._resolve_schedule_config(template)
+
+    async def _remove_workspace_for_child(
+        self, issue_id: str, issue_identifier: str
+    ) -> None:
+        """Route child-terminal workspace cleanup through workspace_mode awareness.
+
+        For children of persistent-mode templates, runs ``before_remove``
+        hook but skips directory/volume deletion — the workspace is keyed
+        by the template identifier and survives individual child terminals.
+
+        For ephemeral (default) or non-scheduled children, performs
+        standard removal keyed by the child's own identifier.
+
+        Safe to call during startup before ``_template_snapshots`` has
+        been populated: the template lookup falls through and the call
+        behaves like the historical ephemeral path.
+        """
+        issue_cfg = self._cfg_for_issue_or_primary(issue_id)
+        ws_root = issue_cfg.workspace.resolved_root()
+        docker_cfg = issue_cfg.docker if issue_cfg.docker.enabled else None
+        repo = self._get_issue_repo_config(issue_id)
+        rendered_hooks = _render_hooks_best_effort(
+            issue_cfg.hooks, repo, issue_cfg.repos_synthesized
+        )
+
+        template_id = self._child_to_template.get(issue_id)
+        if template_id:
+            schedule_cfg = self._resolve_schedule_config_for_template(template_id)
+            template = self._template_snapshots.get(template_id)
+            if schedule_cfg and template and schedule_cfg.workspace_mode == "persistent":
+                # Persistent: preserve the template-keyed workspace across
+                # this child's terminal. before_remove still runs.
+                await remove_workspace(
+                    ws_root,
+                    template.identifier,
+                    repo.name,
+                    rendered_hooks,
+                    docker_cfg=docker_cfg,
+                    workspace_key=sanitize_key(template.identifier),
+                    skip_removal=True,
+                )
+                return
+
+        # Fallback: ephemeral / non-scheduled child — destroy per-child workspace.
+        await remove_workspace(
+            ws_root,
+            issue_identifier,
+            repo.name,
+            rendered_hooks,
+            docker_cfg=docker_cfg,
+        )
+
+    async def _remove_workspace_for_template(self, template_id: str) -> None:
+        """Tear down a template's persistent workspace.
+
+        Called from ``_cleanup_template_state`` on template exit. Runs
+        the ``before_remove`` hook AND deletes the directory / Docker
+        volume. For templates whose schedule is not persistent-mode or
+        whose snapshot is missing, this is a no-op.
+        """
+        template = self._template_snapshots.get(template_id)
+        if not template:
+            return
+        schedule_cfg = self._resolve_schedule_config_for_template(template_id)
+        if not schedule_cfg or schedule_cfg.workspace_mode != "persistent":
+            return
+        ws_root = self.cfg.workspace.resolved_root()
+        docker_cfg = self.cfg.docker if self.cfg.docker.enabled else None
+        await remove_workspace(
+            ws_root,
+            template.identifier,
+            self.cfg.hooks,
+            docker_cfg=docker_cfg,
+            workspace_key=sanitize_key(template.identifier),
+            skip_removal=False,
+        )
 
     def _fire_and_forget(self, coro) -> None:
         """Schedule a coroutine without awaiting it. Prevents GC of the task."""
@@ -811,6 +911,11 @@ class Orchestrator:
                 logger.info(f"Killed {count} orphaned agent containers")
 
         # Per-project terminal-issue workspace cleanup.
+        #
+        # Startup runs before _fetch_templates has populated
+        # _template_snapshots, so persistent-mode routing for scheduled-job
+        # children falls through to ephemeral removal here. Unit 8 extends
+        # startup to fetch templates first for correct routing.
         for slug, parsed in self.configs.items():
             pcfg = parsed.config
             try:
@@ -1278,15 +1383,7 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"Failed to move {issue.identifier} to terminal: {e}")
             try:
-                ws_root = issue_cfg.workspace.resolved_root()
-                repo = self._get_issue_repo_config(issue.id)
-                rendered_hooks = _render_hooks_best_effort(
-                    issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                )
-                await remove_workspace(
-                    ws_root, issue.identifier, repo.name, rendered_hooks,
-                    docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
-                )
+                await self._remove_workspace_for_child(issue.id, issue.identifier)
             except Exception as e:
                 logger.warning(f"Failed to remove workspace for {issue.identifier}: {e}")
             self._cleanup_issue_state(issue.id)
@@ -3391,15 +3488,7 @@ class Orchestrator:
                     )
                     cached = self._last_issues.get(issue_id)
                     if cached:
-                        ws_root = issue_cfg.workspace.resolved_root()
-                        repo = self._get_issue_repo_config(issue_id)
-                        rendered_hooks = _render_hooks_best_effort(
-                            issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                        )
-                        await remove_workspace(
-                            ws_root, cached.identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
-                        )
+                        await self._remove_workspace_for_child(issue_id, cached.identifier)
                     self._cleanup_issue_state(issue_id)
                 continue
 
@@ -3416,26 +3505,14 @@ class Orchestrator:
 
                     attempt = self.running.get(issue_id)
                     if attempt:
-                        ws_root = issue_cfg.workspace.resolved_root()
-                        repo = self._get_issue_repo_config(issue_id)
-                        rendered_hooks = _render_hooks_best_effort(
-                            issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                        )
-                        await remove_workspace(
-                            ws_root, attempt.issue_identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
+                        await self._remove_workspace_for_child(
+                            issue_id, attempt.issue_identifier
                         )
                 else:
                     cached = self._last_issues.get(issue_id)
                     if cached:
-                        ws_root = issue_cfg.workspace.resolved_root()
-                        repo = self._get_issue_repo_config(issue_id)
-                        rendered_hooks = _render_hooks_best_effort(
-                            issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                        )
-                        await remove_workspace(
-                            ws_root, cached.identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
+                        await self._remove_workspace_for_child(
+                            issue_id, cached.identifier
                         )
 
                 self._cleanup_issue_state(issue_id)

@@ -139,14 +139,33 @@ async def ensure_workspace(
     hooks: HooksConfig,
     docker_cfg: DockerConfig | None = None,
     docker_image: str = "",
+    *,
+    workspace_key: str | None = None,
 ) -> WorkspaceResult:
     """Create or reuse a workspace for an (issue, repo) pair.
 
     v1 uses a composite workspace key ``{issue}-{repo}``. Legacy 1:1 configs
     pass ``repo_name='_default'`` (the synthetic fallback) and get a path
     like ``{workspace_root}/SMI-14-_default``.
+
+    Parameters:
+        workspace_key: Optional explicit key override for the workspace
+            directory / Docker volume. When provided, this key is used
+            instead of the composite ``{issue}-{repo}`` key. The caller
+            may pass either a raw identifier or a pre-sanitized key —
+            the value is run through ``sanitize_key`` defensively to
+            preserve the path-escape invariant asserted below.
+
+            Scheduled-job persistent mode keys workspaces by the template
+            identifier so all child fires share one workspace.
     """
-    key = compose_workspace_key(issue_identifier, repo_name)
+    # Route caller-provided key through sanitize_key defensively — preserves
+    # the workspace-under-root invariant even if someone passes a raw string.
+    key = (
+        sanitize_key(workspace_key)
+        if workspace_key is not None
+        else compose_workspace_key(issue_identifier, repo_name)
+    )
     ws_path = workspace_root / key
 
     if docker_cfg and docker_cfg.enabled:
@@ -206,17 +225,45 @@ async def remove_workspace(
     repo_name: str,
     hooks: HooksConfig,
     docker_cfg: DockerConfig | None = None,
+    *,
+    workspace_key: str | None = None,
+    skip_removal: bool = False,
 ) -> None:
-    """Remove a workspace directory for a terminal (issue, repo) pair."""
-    key = compose_workspace_key(issue_identifier, repo_name)
+    """Remove a workspace directory for a terminal (issue, repo) pair.
+
+    Parameters:
+        workspace_key: Optional explicit key override. Routed through
+            ``sanitize_key`` defensively. See ``ensure_workspace`` for
+            details.
+        skip_removal: When True, runs the ``before_remove`` hook but
+            does NOT delete the directory or Docker volume. Used for
+            persistent-workspace children (scheduled jobs) where the
+            workspace survives the child's terminal and is reused
+            across fires. The ``before_remove`` hook is still useful
+            for per-fire cleanup within the preserved workspace.
+    """
+    # Route caller-provided key through sanitize_key defensively — preserves
+    # the workspace-under-root invariant even if someone passes a raw string.
+    key = (
+        sanitize_key(workspace_key)
+        if workspace_key is not None
+        else compose_workspace_key(issue_identifier, repo_name)
+    )
     ws_path = workspace_root / key
 
     if docker_cfg and docker_cfg.enabled:
         from .docker_runner import remove_workspace_volume
 
-        # before_remove runs locally (R20)
+        # before_remove runs locally (R20). Runs regardless of skip_removal
+        # so persistent-mode children can perform per-fire cleanup inside
+        # the preserved volume.
         if hooks.before_remove:
             await run_hook(hooks.before_remove, ws_path, hooks.timeout_ms, "before_remove", force_local=True)
+        if skip_removal:
+            logger.info(
+                f"Preserving workspace volume issue={issue_identifier} key={key} (skip_removal=True)"
+            )
+            return
         removed = await remove_workspace_volume(docker_cfg, key)
         if removed:
             logger.info(f"Removing workspace volume issue={issue_identifier} key={key}")
@@ -230,6 +277,12 @@ async def remove_workspace(
 
     if hooks.before_remove:
         await run_hook(hooks.before_remove, ws_path, hooks.timeout_ms, "before_remove")
+
+    if skip_removal:
+        logger.info(
+            f"Preserving workspace issue={issue_identifier} path={ws_path} (skip_removal=True)"
+        )
+        return
 
     logger.info(f"Removing workspace issue={issue_identifier} path={ws_path}")
     shutil.rmtree(ws_path, ignore_errors=True)
