@@ -3964,6 +3964,18 @@ class Orchestrator:
                 ]
                 agent_env["STOKOWSKI_REPOS_JSON"] = json.dumps(repo_list)
 
+            # Scheduled-job carve-out: for children of scheduled templates,
+            # pass the parent template identifier so the Claude runner
+            # extends the scope-restriction guardrail to permit cross-fire
+            # status comments on the parent template (R25). None for
+            # non-scheduled issues — no behavior change.
+            _sched_template = self._template_snapshots.get(
+                self._child_to_template.get(issue.id, ""), None
+            )
+            template_identifier_for_runner = (
+                _sched_template.identifier if _sched_template else None
+            )
+
             # Build log path if logging enabled (per-project logging config).
             log_path = None
             if cfg.logging.enabled and cfg.logging.log_dir:
@@ -3995,6 +4007,7 @@ class Orchestrator:
                     workspace_key=ws.workspace_key,
                     docker_image=docker_image,
                     log_path=log_path,
+                    template_identifier=template_identifier_for_runner,
                 )
             else:
                 # Legacy mode: multi-turn loop
@@ -4050,6 +4063,7 @@ class Orchestrator:
                         workspace_key=ws.workspace_key,
                         docker_image=docker_image,
                         log_path=turn_log_path,
+                        template_identifier=template_identifier_for_runner,
                     )
 
                     if attempt.status != "succeeded":
@@ -4066,6 +4080,41 @@ class Orchestrator:
             attempt.status = "failed"
             attempt.error = str(e)
             self._on_worker_exit(issue, attempt)
+
+    def _scheduled_child_context(
+        self, child_issue: Issue
+    ) -> tuple[Issue | None, str | None, int]:
+        """Derive (template_issue, fire_slot, previous_fires_count) for a child.
+
+        For scheduled-job children, returns the parent template Issue, the slot
+        label value the child carries (e.g. ``2026-04-19T08:00:00Z`` or
+        ``trigger:...``), and an approximate count of prior successful fires
+        of the same template.
+
+        For non-scheduled issues, returns ``(None, None, 0)``.
+
+        ``previous_fires_count`` is approximated from the sibling count
+        (other children of the same template currently tracked). It does not
+        differentiate terminal-state children from in-flight, and undercounts
+        by the number of already-archived siblings — acceptable for operator
+        context, refinement deferred.
+        """
+        template_id = self._child_to_template.get(child_issue.id)
+        if not template_id:
+            return (None, None, 0)
+
+        template_issue = self._template_snapshots.get(template_id)
+
+        fire_slot: str | None = None
+        for label in child_issue.labels or []:
+            if label.lower().startswith("slot:"):
+                fire_slot = label.split(":", 1)[1]
+                break
+
+        siblings = self._template_children.get(template_id, set())
+        previous_fires_count = max(0, len(siblings) - 1)
+
+        return (template_issue, fire_slot, previous_fires_count)
 
     async def _render_prompt_async(
         self, issue: Issue, attempt_num: int | None, state_name: str | None = None
@@ -4098,6 +4147,12 @@ class Orchestrator:
             repo = self._get_issue_repo_config(issue.id)
 
             workflow_dir = str(self._workflow_dir_for_issue(issue.id))
+
+            # Scheduled-job carve-out context (None for non-scheduled issues)
+            template_issue, fire_slot, previous_fires_count = (
+                self._scheduled_child_context(issue)
+            )
+
             return assemble_prompt(
                 cfg=cfg,
                 workflow_dir=workflow_dir,
@@ -4111,6 +4166,9 @@ class Orchestrator:
                 comments=comments,
                 transitions=wf_transitions,
                 repo=repo,
+                template_issue=template_issue,
+                fire_slot=fire_slot,
+                previous_fires_count=previous_fires_count,
             )
 
         # Legacy fallback

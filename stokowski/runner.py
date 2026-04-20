@@ -673,8 +673,15 @@ async def run_turn(
     workspace_key: str = "",
     docker_image: str = "",
     log_path: Path | None = None,
+    template_identifier: str | None = None,
 ) -> RunAttempt:
-    """Route to the correct runner based on runner_type."""
+    """Route to the correct runner based on runner_type.
+
+    When ``template_identifier`` is provided, the Claude runner threads it
+    into the scope-restriction guardrail so the scheduled-job child is
+    permitted to post cross-fire status comments on its parent template.
+    Codex runs ignore the parameter for now (no equivalent guardrail).
+    """
     if runner_type == "codex":
         return await run_codex_turn(
             model=claude_cfg.model,
@@ -707,6 +714,7 @@ async def run_turn(
             workspace_key=workspace_key,
             docker_image=docker_image,
             log_path=log_path,
+            template_identifier=template_identifier,
         )
     else:
         raise ValueError(f"Unknown runner type: {runner_type}")

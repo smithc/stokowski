@@ -409,6 +409,10 @@ def assemble_prompt(
     comments: list[dict[str, Any]] | None = None,
     transitions: dict[str, str] | None = None,
     repo: RepoConfig | None = None,
+    *,
+    template_issue: Issue | None = None,
+    fire_slot: str | None = None,
+    previous_fires_count: int = 0,
 ) -> str:
     """Orchestrate three-layer prompt assembly.
 
@@ -489,6 +493,9 @@ def assemble_prompt(
         recent_comments=recent,
         transitions=transitions,
         repo=repo,
+        template_issue=template_issue,
+        fire_slot=fire_slot,
+        previous_fires_count=previous_fires_count,
     )
     parts.append(lifecycle)
 
