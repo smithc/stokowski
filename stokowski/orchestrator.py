@@ -125,6 +125,42 @@ def _render_hooks_best_effort(
         return hooks
 
 
+# R21: Number of consecutive reconcile ticks a template must be absent from
+# Linear before we treat it as hard-deleted and cascade-cleanup children +
+# persistent workspace. Transient API errors / single-tick blips reset the
+# counter to 0, so this guards against false positives.
+TEMPLATE_HARD_DELETE_THRESHOLD_TICKS = 3
+
+
+def classify_missing_id(
+    id_: str,
+    templates: set[str],
+    running: set[str] | dict[str, Any],
+    pending_gates: set[str] | dict[str, Any],
+) -> str:
+    """Classify a Linear-absent issue id for reconciliation branching.
+
+    Returns one of:
+      * ``"template"`` — id is tracked in ``templates`` (apply N-tick threshold)
+      * ``"gated"``    — id is gated but not running (immediate cleanup)
+      * ``"running"``  — id has a running worker (immediate cleanup)
+      * ``"unknown"``  — id is in none of the tracking sets
+
+    Membership checks are O(1) against plain sets or dict key-views. The
+    helper is deliberately pure so it can be unit-tested without
+    constructing an Orchestrator. When an id lives in more than one bucket
+    (e.g. a template id somehow also in ``running``), ``"template"`` wins
+    so the cascade path is chosen consistently.
+    """
+    if id_ in templates:
+        return "template"
+    if id_ in running:
+        return "running"
+    if id_ in pending_gates:
+        return "gated"
+    return "unknown"
+
+
 class Orchestrator:
     def __init__(self, workflow_paths):
         """
@@ -609,6 +645,81 @@ class Orchestrator:
         # _cleanup_issue_state. Unit 8 extends this to cascade-cancel
         # in-flight children.
 
+    async def _cascade_template_delete(self, template_id: str) -> None:
+        """Template hard-delete detected after N-tick threshold (R21).
+
+        Cancels in-flight children (best-effort via existing
+        ``_kill_worker`` + ``_cleanup_issue_state``; Unit 9 refactors
+        this path into the R8 cancel-previous protocol with a graceful
+        audit-trail transition), destroys persistent workspace (if any),
+        and fully cleans up per-template tracking state.
+
+        Idempotent: subsequent calls with the same ``template_id`` are
+        no-ops because ``_cleanup_template_state`` clears the tracking
+        sets the caller iterates.
+        """
+        logger.warning(
+            f"Template hard-delete detected template={template_id} — "
+            f"cascading cleanup after "
+            f"{TEMPLATE_HARD_DELETE_THRESHOLD_TICKS} consecutive absences"
+        )
+        # Snapshot child ids before mutating tracking — the cancel path
+        # will mutate _template_children / _child_to_template.
+        children = list(self._template_children.get(template_id, set()))
+        for child_id in children:
+            try:
+                await self._kill_worker(
+                    child_id, reason="template_deleted"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"kill_worker failed for child={child_id} during "
+                    f"cascade delete of template={template_id}: {e}"
+                )
+            # _cleanup_issue_state handles reverse-index + standard
+            # cleanup. Safe regardless of whether the child was running.
+            self._cleanup_issue_state(child_id)
+        # _cleanup_template_state also handles _remove_workspace_for_template
+        # internally and wipes all per-template tracking.
+        await self._cleanup_template_state(template_id)
+
+    async def _rehydrate_template_indexes(self) -> None:
+        """After ``_fetch_templates`` populates ``_template_snapshots``,
+        rebuild the child reverse index and seed seq counters from Linear.
+
+        Called once on startup. No-op when ``_template_snapshots`` is
+        empty. Per-template failures are logged and skipped — one
+        transient fetch error must not block the rest of startup.
+        """
+        if not self._template_snapshots:
+            return
+        client = self._ensure_linear_client()
+        for template_id, template in list(self._template_snapshots.items()):
+            try:
+                children = await client.fetch_template_children(
+                    template_id, include_archived=False
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch children for template={template_id} "
+                    f"during rehydration: {e}"
+                )
+                continue
+            child_ids = {c.id for c in children}
+            self._template_children[template_id] = child_ids
+            for cid in child_ids:
+                self._child_to_template[cid] = template_id
+            # Seed seq counter from existing fire watermarks so a restart
+            # doesn't reset to 0 (which would briefly tie new watermarks
+            # with pre-restart ones during supersession).
+            try:
+                await self._seed_seq_from_linear(template)
+            except Exception as e:
+                logger.debug(
+                    f"seq seed failed during rehydration for "
+                    f"{template.identifier}: {e}"
+                )
+
     def _resolve_schedule_config_for_template(
         self, template_id: str
     ) -> "ScheduleConfig | None":  # noqa: F821 — forward ref
@@ -902,6 +1013,14 @@ class Orchestrator:
         container cleanup runs once (containers are labeled globally).
         Volume pruning unions active keys across every docker-enabled project
         and prunes in a single pass.
+
+        Unit 8 extends this to:
+          1. Fetch templates + rehydrate reverse index so
+             ``_remove_workspace_for_child`` can route persistent-mode
+             children correctly (skip removal).
+          2. Sweep orphaned Docker volumes via ``cleanup_orphaned_volumes``,
+             passing the union of persistent-template keys and in-flight
+             active-state child keys so we don't destroy live volumes.
         """
         any_docker = any(p.config.docker.enabled for p in self.configs.values())
 
@@ -910,12 +1029,23 @@ class Orchestrator:
             if count:
                 logger.info(f"Killed {count} orphaned agent containers")
 
-        # Per-project terminal-issue workspace cleanup.
-        #
-        # Startup runs before _fetch_templates has populated
-        # _template_snapshots, so persistent-mode routing for scheduled-job
-        # children falls through to ephemeral removal here. Unit 8 extends
-        # startup to fetch templates first for correct routing.
+        # Fetch templates + rehydrate BEFORE routing terminal cleanup, so
+        # persistent-mode children get the skip-removal branch.
+        try:
+            await self._fetch_templates()
+        except Exception as e:
+            logger.warning(f"Startup template fetch failed (continuing): {e}")
+        try:
+            await self._rehydrate_template_indexes()
+        except Exception as e:
+            logger.warning(
+                f"Startup template index rehydration failed (continuing): {e}"
+            )
+
+        # Per-project terminal-issue workspace cleanup + active-state snapshot.
+        # Terminal removal routes through _remove_workspace_for_child so
+        # persistent-mode children get the skip-removal branch.
+        active_issue_identifiers: set[str] = set()
         for slug, parsed in self.configs.items():
             pcfg = parsed.config
             try:
@@ -924,27 +1054,30 @@ class Orchestrator:
                     pcfg.tracker.project_slug,
                     pcfg.terminal_linear_states(),
                 )
-                ws_root = pcfg.workspace.resolved_root()
                 for issue in terminal:
-                    for repo in pcfg.repos.values():
-                        rendered_hooks = _render_hooks_best_effort(
-                            pcfg.hooks, repo, pcfg.repos_synthesized,
-                        )
-                        await remove_workspace(
-                            ws_root, issue.identifier, repo.name, rendered_hooks,
-                            docker_cfg=pcfg.docker if pcfg.docker.enabled else None,
-                        )
+                    await self._remove_workspace_for_child(issue.id, issue.identifier)
+                active = await client.fetch_issues_by_states(
+                    pcfg.tracker.project_slug,
+                    pcfg.active_linear_states(),
+                )
+                for i in active:
+                    if i.identifier:
+                        active_issue_identifiers.add(i.identifier)
             except Exception as e:
                 logger.warning(f"Startup cleanup failed for {slug} (continuing): {e}")
 
         # Union Docker volume pruning across docker-enabled projects.
+        # Preserves in-flight active-state children (composite keys) and every
+        # known template identifier (persistent-mode workspace keys).
         if any_docker:
             try:
-                active_keys: set[str] = set()
                 from .workspace import compose_workspace_key
+
+                active_keys: set[str] = set()
+                # Active-state composite keys (identifier-repo) across projects.
                 for issue_id, issue_obj in self._last_issues.items():
-                    # Resolve the issue's project; fall back to every project's
-                    # repos if binding not known (conservative union).
+                    if issue_obj.identifier not in active_issue_identifiers:
+                        continue
                     slug = self._issue_project.get(issue_id)
                     if slug and slug in self.configs:
                         repos = self.configs[slug].config.repos.values()
@@ -958,6 +1091,14 @@ class Orchestrator:
                         active_keys.add(
                             compose_workspace_key(issue_obj.identifier, repo.name).lower()
                         )
+                # Template identifiers — persistent-mode workspace keys.
+                # Preserve every known template regardless of mode; ephemeral
+                # templates typically have no volume so this is cheap and
+                # avoids accidents if an operator flips modes across a restart.
+                for template in self._template_snapshots.values():
+                    if template.identifier:
+                        active_keys.add(sanitize_key(template.identifier))
+
                 # Use the first docker-enabled project's DockerConfig for the
                 # volume-cleanup call (volume labels are global).
                 docker_cfg_for_cleanup = next(
@@ -968,10 +1109,10 @@ class Orchestrator:
                 removed = await cleanup_orphaned_volumes(docker_cfg_for_cleanup, active_keys)
                 if removed:
                     logger.info(
-                        f"Pruned {removed} orphaned Docker workspace volume(s)"
+                        f"Startup: removed {removed} orphaned workspace volumes"
                     )
             except Exception as e:
-                logger.warning(f"Docker volume cleanup failed (continuing): {e}")
+                logger.warning(f"Orphan volume sweep failed (continuing): {e}")
 
         await self._cleanup_logs()
 
@@ -3439,8 +3580,18 @@ class Orchestrator:
         Multi-project: fetch each issue's state through ITS project's client
         and compare against ITS project's state names (active/terminal/review
         differ per project).
+
+        Unit 8: also reconciles templates for R21 hard-delete detection.
+        Templates absent from the Linear response for
+        ``TEMPLATE_HARD_DELETE_THRESHOLD_TICKS`` consecutive ticks trigger
+        ``_cascade_template_delete`` (cancel in-flight children, remove
+        persistent workspace, clear all per-template state). A single
+        blip resets the counter — the fetch is best-effort and transient
+        errors must not poison the threshold.
         """
-        ids_to_check = set(self.running) | set(self._pending_gates)
+        ids_to_check = (
+            set(self.running) | set(self._pending_gates) | set(self._templates)
+        )
         if not ids_to_check:
             return
 
@@ -3482,7 +3633,22 @@ class Orchestrator:
 
             if current_state is None:
                 # Issue not found in Linear — may be deleted/archived.
-                if issue_id in self._pending_gates and issue_id not in self.running:
+                # Discriminate: template vs gated vs running.
+                kind = classify_missing_id(
+                    issue_id,
+                    self._templates,
+                    self.running,
+                    self._pending_gates,
+                )
+                if kind == "template":
+                    # Template absent: apply N-tick threshold to avoid
+                    # mistaking a transient blip for a hard delete.
+                    n = self._template_last_seen.get(issue_id, 0) + 1
+                    self._template_last_seen[issue_id] = n
+                    if n >= TEMPLATE_HARD_DELETE_THRESHOLD_TICKS:
+                        await self._cascade_template_delete(issue_id)
+                    continue
+                if kind == "gated":
                     logger.info(
                         f"Reconciliation: gated issue {issue_id} not found in Linear, cleaning up"
                     )
@@ -3490,6 +3656,15 @@ class Orchestrator:
                     if cached:
                         await self._remove_workspace_for_child(issue_id, cached.identifier)
                     self._cleanup_issue_state(issue_id)
+                # "running" and "unknown" — skip (existing behavior)
+                continue
+
+            # Template is still present in Linear — reset the absent
+            # counter so earlier transient errors don't accumulate.
+            if issue_id in self._templates:
+                self._template_last_seen.pop(issue_id, None)
+                # Template is present + alive; no further child-oriented
+                # state handling applies to templates here.
                 continue
 
             state_lower = current_state.strip().lower()
