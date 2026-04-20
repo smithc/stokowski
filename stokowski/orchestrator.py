@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -216,6 +217,69 @@ def classify_missing_id(
     return "unknown"
 
 
+# R16: Marker filename the operator drops next to workflow.yaml to acknowledge
+# a workspace_mode change. Content is the 16-hex-char change hash surfaced in
+# the refusal log line.
+WORKSPACE_MODE_ACK_FILENAME = ".schedule-workspace-reset-ack"
+
+
+def compute_workspace_mode_change_hash(
+    changes: dict[str, tuple[str, str]],
+) -> str:
+    """Compute a stable 16-char hex hash of workspace-mode changes.
+
+    ``changes`` maps schedule-type name to ``(old_mode, new_mode)``. The
+    ordering is normalized via ``sorted(items())`` so the hash is
+    deterministic regardless of dict iteration order.
+
+    Returns the first 16 hex characters of the SHA-256 digest — enough
+    entropy to prevent collision between unrelated changes while keeping
+    the marker file content human-copy-pasteable.
+    """
+    # Serialize as a JSON array of [name, [old, new]] triples for stability.
+    serialized = json.dumps(
+        [[name, [old, new]] for name, (old, new) in sorted(changes.items())],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def detect_workspace_mode_changes(
+    old_schedules: dict[str, Any],
+    new_schedules: dict[str, Any],
+    live_schedule_types: set[str],
+) -> dict[str, tuple[str, str]]:
+    """Identify schedule types whose ``workspace_mode`` changed across a reload.
+
+    Only schedule types present in ``live_schedule_types`` (templates known
+    to Linear) are considered — a workspace_mode change for a schedule with
+    no existing templates does not require an acknowledgement because
+    there's no workspace to reset.
+
+    ``old_schedules`` and ``new_schedules`` are dicts mapping schedule-type
+    name to a ``ScheduleConfig``-shaped object exposing ``workspace_mode``.
+    Schedule types added in the new config (absent from the old) are
+    ignored here; there's no prior semantic to conflict with.
+
+    Returns ``{schedule_type: (old_mode, new_mode)}`` for each detected
+    change. Empty dict means no acknowledgement required.
+    """
+    changes: dict[str, tuple[str, str]] = {}
+    for name, old_sc in old_schedules.items():
+        if name not in new_schedules:
+            # Removed schedule type — no mode change to acknowledge.
+            continue
+        if name not in live_schedule_types:
+            # No template of this schedule type is live in Linear.
+            continue
+        old_mode = getattr(old_sc, "workspace_mode", "ephemeral")
+        new_mode = getattr(new_schedules[name], "workspace_mode", "ephemeral")
+        if old_mode != new_mode:
+            changes[name] = (old_mode, new_mode)
+    return changes
+
+
 class Orchestrator:
     def __init__(self, workflow_paths):
         """
@@ -352,6 +416,18 @@ class Orchestrator:
         self._retention_poison_pill_counts: dict[str, int] = {}           # child_id -> consecutive archive failure count
         self._retention_backlog_detected: bool = False                    # set True when a sweep fills its budget (dashboard, Unit 13)
         self._retention_last_archive_at: dict[str, datetime] = {}         # child_id -> last successful archive wall-clock (optional, for dashboard)
+
+        # R16: Workspace-mode change refusal. When a reload detects a
+        # workspace_mode change on a schedule type that has live templates
+        # and the operator has not dropped a matching marker file, the old
+        # config remains active. Refusal clears when the marker appears and
+        # matches the computed hash (marker is then consumed).
+        #
+        # Multi-project: the check is applied to the PRIMARY project only.
+        # Schedules / scheduled-jobs templates are single-project scope in v1.
+        self._workspace_mode_refused: bool = False
+        self._workspace_mode_refused_hash: str | None = None
+        self._workspace_mode_refused_changes: dict[str, tuple[str, str]] = {}
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -523,8 +599,30 @@ class Orchestrator:
             if iid in self._issue_project
         }
 
+        # R16 workspace-mode ack gate — applies to the primary project only
+        # (scheduled-jobs are v1 single-project scope, and the scalar
+        # refusal state reflects that). Primary is the first workflow_path
+        # in the caller's order, matching how self.workflow is resolved.
+        primary_path = self.workflow_paths[0] if self.workflow_paths else None
+        primary_slug: str | None = None
+        if primary_path is not None:
+            for slug, p in new_paths.items():
+                if p == primary_path:
+                    primary_slug = slug
+                    break
+
         # Replace entries that loaded cleanly this tick.
         for slug, parsed in new_configs.items():
+            prior = self.configs.get(slug)
+            if (
+                slug == primary_slug
+                and prior is not None
+                and not self._check_workspace_mode_ack(
+                    slug, prior, parsed, new_paths[slug]
+                )
+            ):
+                # Refusal — keep last-known-good prior config for this slug.
+                continue
             self.configs[slug] = parsed
             self._config_paths[slug] = new_paths[slug]
 
@@ -560,6 +658,123 @@ class Orchestrator:
             self._config_blocked.clear()
 
         return errors_map
+
+    def _check_workspace_mode_ack(
+        self,
+        slug: str,
+        prior: ParsedConfig,
+        new_parsed: ParsedConfig,
+        workflow_path: Path,
+    ) -> bool:
+        """R16 workspace-mode refusal gate for a single project.
+
+        Returns True if the new config may replace the prior in
+        ``self.configs[slug]``; False if the swap is refused (old config
+        stays active) or if marker consumption failed.
+
+        When changes are detected for schedule types with live templates
+        the caller must drop an ack marker file
+        (``WORKSPACE_MODE_ACK_FILENAME``) next to the workflow file whose
+        contents match the computed change hash. The marker is consumed
+        on acceptance so standing consent never carries into a subsequent
+        reload.
+
+        Multi-project: this helper is currently invoked only for the
+        primary project. The refusal state fields are scalar and reflect
+        that scope.
+        """
+        prior_schedules = prior.config.schedules
+        new_schedules = new_parsed.config.schedules
+
+        # Only the primary project's templates participate in v1; the
+        # snapshot is global so filtering would add little signal.
+        live_types: set[str] = set()
+        for template in self._template_snapshots.values():
+            sched_name = self._resolve_schedule_name(template)
+            if sched_name:
+                live_types.add(sched_name)
+                for key in prior_schedules:
+                    if key.lower() == sched_name.lower():
+                        live_types.add(key)
+
+        changes = detect_workspace_mode_changes(
+            prior_schedules, new_schedules, live_types
+        )
+
+        if not changes:
+            if self._workspace_mode_refused:
+                logger.info(
+                    "Workspace-mode change refusal cleared: no live "
+                    "templates affected by the pending diff."
+                )
+                self._workspace_mode_refused = False
+                self._workspace_mode_refused_hash = None
+                self._workspace_mode_refused_changes = {}
+            return True
+
+        change_hash = compute_workspace_mode_change_hash(changes)
+        marker_path = workflow_path.parent / WORKSPACE_MODE_ACK_FILENAME
+
+        marker_ok = False
+        marker_content: str | None = None
+        if marker_path.exists():
+            try:
+                marker_content = marker_path.read_text(encoding="utf-8").strip()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to read workspace-mode ack marker at "
+                    f"{marker_path}: {e}"
+                )
+            if marker_content == change_hash:
+                marker_ok = True
+
+        if marker_ok:
+            # Consume the marker first; a failure to unlink must not leave
+            # a standing ack on disk that silently re-consents to the next
+            # change.
+            try:
+                marker_path.unlink()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to consume workspace-mode ack marker at "
+                    f"{marker_path}: {e} — refusing the change to avoid "
+                    f"standing consent"
+                )
+                self._workspace_mode_refused = True
+                self._workspace_mode_refused_hash = change_hash
+                self._workspace_mode_refused_changes = dict(changes)
+                return False
+
+            changed_summary = ", ".join(
+                f"{n}={o}->{w}" for n, (o, w) in sorted(changes.items())
+            )
+            logger.info(
+                f"Workspace-mode change accepted (hash={change_hash}): "
+                f"{changed_summary}. Marker consumed at {marker_path}."
+            )
+            self._workspace_mode_refused = False
+            self._workspace_mode_refused_hash = None
+            self._workspace_mode_refused_changes = {}
+            return True
+
+        # No ack (or hash mismatch) — refuse the swap and keep the old
+        # config active. The refusal log is emitted on every tick the
+        # condition persists.
+        self._workspace_mode_refused = True
+        self._workspace_mode_refused_hash = change_hash
+        self._workspace_mode_refused_changes = dict(changes)
+        changed_summary = ", ".join(
+            f"{n}={o}->{w}" for n, (o, w) in sorted(changes.items())
+        )
+        in_flight = len(self.running)
+        logger.warning(
+            f"Workspace-mode change refused for project={slug}: expected "
+            f"marker at {marker_path} with hash {change_hash}. "
+            f"Old config remains active; {in_flight} children in flight "
+            f"under old semantics. "
+            f"Changed types: {changed_summary}."
+        )
+        return False
 
     def _ensure_linear_client(self) -> LinearClient:
         """Legacy single-client accessor.
