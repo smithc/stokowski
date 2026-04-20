@@ -8,7 +8,7 @@ import logging
 import os
 import signal
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,7 @@ from .tracking import (
     make_schedule_error_comment,
     make_state_comment,
     parse_fired_by_slot,
+    parse_latest_schedule_error,
     parse_latest_tracking,
 )
 from .workspace import ensure_workspace, remove_workspace, sanitize_key
@@ -132,6 +133,58 @@ def _render_hooks_best_effort(
 # persistent workspace. Transient API errors / single-tick blips reset the
 # counter to 0, so this guards against false positives.
 TEMPLATE_HARD_DELETE_THRESHOLD_TICKS = 3
+
+
+# R13: Maximum number of archive mutations issued per retention sweep tick.
+# Bounds the per-tick work so a large backlog can't block the orchestrator
+# loop. Oldest-first ordering + next-tick continuation handles overflow.
+# TODO: expose via ``ServerConfig.retention_budget_per_tick`` if operators
+# hit the backlog in production.
+RETENTION_BUDGET_PER_TICK = 20
+
+# R13: Consecutive archive failures on the same child before the sweep
+# gives up on that child (poison pill). Prevents an un-archivable issue
+# from wasting one budget slot every tick.
+RETENTION_POISON_PILL_THRESHOLD = 5
+
+
+def select_retention_candidates(
+    children: list[Issue],
+    now: datetime,
+    retention_days: int,
+    terminal_type_values: tuple[str, ...] = ("completed", "canceled"),
+) -> list[Issue]:
+    """Pure helper: pick archive candidates from a template's children.
+
+    Filters to terminal, non-archived children whose ``updated_at`` age
+    exceeds ``retention_days``. Returns oldest-first (ascending
+    ``updated_at``), so callers can slice from the front to honour the
+    per-tick budget.
+
+    Mirrors the style of ``cleanup_old_logs`` / ``enforce_size_limit``
+    below — pure, unit-testable, no I/O.
+    """
+    if retention_days < 1:
+        return []
+    cutoff = now - timedelta(days=retention_days)
+    eligible: list[Issue] = []
+    for child in children:
+        if child is None or not child.id:
+            continue
+        if child.archived_at is not None:
+            continue
+        state_type = (child.state_type or "").lower()
+        if state_type not in terminal_type_values:
+            continue
+        updated = child.updated_at
+        if updated is None:
+            # No timestamp = can't reason about age, skip conservatively.
+            continue
+        if updated >= cutoff:
+            continue
+        eligible.append(child)
+    eligible.sort(key=lambda c: c.updated_at or datetime.min.replace(tzinfo=timezone.utc))
+    return eligible
 
 
 def classify_missing_id(
@@ -292,6 +345,13 @@ class Orchestrator:
         self._template_fire_attempts: dict[tuple[str, str], int] = {}     # (template_id, slot) -> attempt counter
         self._template_next_fire_at: dict[str, datetime] = {}             # template_id -> computed next-fire time (dashboard, Unit 13)
         self._template_seq_seeded: set[str] = set()                       # template_ids whose seq counter was rehydrated from Linear this process lifetime
+
+        # Retention sweep state (Unit 10, R13). Not keyed by template —
+        # by child id — so these survive template-level cleanup and
+        # re-check on subsequent ticks.
+        self._retention_poison_pill_counts: dict[str, int] = {}           # child_id -> consecutive archive failure count
+        self._retention_backlog_detected: bool = False                    # set True when a sweep fills its budget (dashboard, Unit 13)
+        self._retention_last_archive_at: dict[str, datetime] = {}         # child_id -> last successful archive wall-clock (optional, for dashboard)
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -1966,6 +2026,11 @@ class Orchestrator:
         if not self._template_snapshots:
             return
 
+        # R18 recovery: clear error-since for templates an operator moved
+        # back to Scheduled. Must run BEFORE any ``_move_template_to_error``
+        # calls below so a fresh error doesn't get its timestamp reset.
+        self._clear_error_state_on_recovery()
+
         client = self._ensure_linear_client()
         now = datetime.now(timezone.utc)
 
@@ -2717,27 +2782,65 @@ class Orchestrator:
         reason: str,
         details: str | None = None,
     ) -> None:
-        """Move a template to the Error Linear state + post a schedule_error comment.
+        """Move a template to the Error Linear state + post an error comment.
 
-        Unit 10 replaces this stub with fuller semantics (idempotency on
-        ``reason``, suppression of duplicate posts). For Unit 6 we keep
-        it simple: post the comment + call ``update_issue_state``.
-        Records ``_template_error_since`` so Unit 10 can measure dwell.
+        Idempotent (R18): inspects the last ``stokowski:schedule_error``
+        comment on the template. Only posts a NEW comment when the latest
+        payload's ``reason`` differs from this call's reason. Prevents the
+        per-tick comment-spam pathology when a template stays stuck on the
+        same invalid cron for hours.
+
+        Comment-write failure fallback: if ``post_comment`` raises (e.g.
+        Linear 403 / rate-limit), a structured ERROR log line is written
+        so operators get *something* even if Linear is flaking. The state
+        move via ``update_issue_state`` is still attempted regardless —
+        the two mutations are independent.
+
+        Always stamps ``_template_error_since[template.id]`` with "now" on
+        the first entry into error state; subsequent calls with the same
+        reason preserve the original timestamp so the dashboard's
+        "Error > 24h" dwell counter is accurate.
         """
         try:
             client = self._ensure_linear_client()
-            body = make_schedule_error_comment(
-                template_id=template.identifier,
-                reason=reason,
-                details=details,
-            )
+            # Idempotency check — fetch latest schedule_error comment and
+            # compare reason. Fetch failures fall through to post the new
+            # comment (safer to risk a duplicate than to skip a real error).
+            existing_reason: str | None = None
             try:
-                await client.post_comment(template.id, body)
+                comments = await client.fetch_comments(template.id)
+                latest = parse_latest_schedule_error(comments or [])
+                if latest is not None:
+                    existing_reason = latest.get("reason")
             except Exception as e:
-                logger.warning(
-                    f"Failed to post schedule_error comment for "
-                    f"{template.identifier}: {e}"
+                logger.debug(
+                    f"Idempotency check for schedule_error failed "
+                    f"(template={template.identifier}): {e}; posting anyway"
                 )
+
+            same_reason = (existing_reason == reason)
+            if not same_reason:
+                body = make_schedule_error_comment(
+                    template_id=template.identifier,
+                    reason=reason,
+                    details=details,
+                )
+                try:
+                    await client.post_comment(template.id, body)
+                except Exception as e:
+                    # Structured fallback log line — operator's last line of
+                    # visibility when Linear is down. Not a warning: this
+                    # is the error surface, so log at ERROR level.
+                    logger.error(
+                        f"schedule_error_comment_write_failed "
+                        f"template={template.identifier} reason={reason} "
+                        f"details={details!r} error={e}"
+                    )
+
+            # Mutation 2 (state move) is attempted regardless of mutation 1.
+            # Even if the comment succeeded last tick, the state may have
+            # been nudged out of Error by a human — moving it back is
+            # cheap and idempotent from Linear's perspective.
             error_state = self.cfg.linear_states.schedule_error
             try:
                 await client.update_issue_state(template.id, error_state)
@@ -2746,17 +2849,192 @@ class Orchestrator:
                     f"Failed to move {template.identifier} to "
                     f"{error_state!r}: {e}"
                 )
-            self._template_error_since[template.id] = datetime.now(timezone.utc)
-            logger.error(
-                f"Template moved to Error template={template.identifier} "
-                f"reason={reason} details={details!r}"
-            )
+
+            # Only stamp the error-since timestamp on FIRST entry or when
+            # reason changed. Preserves dwell-time accuracy for the
+            # dashboard's "Error > 24h" metric.
+            if template.id not in self._template_error_since or not same_reason:
+                self._template_error_since[template.id] = datetime.now(timezone.utc)
+
+            # Log at ERROR on first entry / reason change; DEBUG on repeats
+            # (operator already saw the first one, no need to spam stderr).
+            if not same_reason:
+                logger.error(
+                    f"Template moved to Error template={template.identifier} "
+                    f"reason={reason} details={details!r}"
+                )
+            else:
+                logger.debug(
+                    f"Template still in Error template={template.identifier} "
+                    f"reason={reason} (idempotent, no new comment)"
+                )
         except Exception as e:
             logger.error(
                 f"_move_template_to_error failed for "
                 f"{template.identifier}: {e}",
                 exc_info=True,
             )
+
+    def _clear_error_state_on_recovery(self) -> None:
+        """Drop ``_template_error_since`` entries for templates back on track.
+
+        R18: when an operator fixes an invalid cron and moves the template
+        back to the Scheduled state, we need to clear the dwell-time
+        counter so the dashboard's "Error > 24h" metric reflects reality.
+
+        Called from ``_evaluate_schedules`` before the per-template loop.
+        Purely a state-machine cleanup — no network I/O.
+        """
+        if not self._template_error_since:
+            return
+        error_state_lower = (self.cfg.linear_states.schedule_error or "").strip().lower()
+        for tmpl_id in list(self._template_error_since):
+            tmpl = self._template_snapshots.get(tmpl_id)
+            if tmpl is None:
+                # Template vanished from Linear — _cleanup_template_state
+                # will handle the removal; leave the entry alone until then.
+                continue
+            current = (tmpl.state or "").strip().lower()
+            if current != error_state_lower:
+                self._template_error_since.pop(tmpl_id, None)
+
+    async def _retention_sweep(self) -> None:
+        """R13: budget-bounded archive of old terminal children.
+
+        Iterates known templates, fetches their non-archived children, and
+        archives those whose ``updated_at`` is older than the template's
+        ``retention_days``. The sweep is bounded by
+        ``RETENTION_BUDGET_PER_TICK`` archive mutations across ALL
+        templates combined — a large backlog from a newly-adopted
+        retention policy won't block the orchestrator loop.
+
+        Ordering:
+          1. Per template, candidates are sorted oldest-first
+             (``updated_at`` ascending).
+          2. Templates are processed in insertion order of
+             ``_template_snapshots``. This is not strictly round-robin —
+             a template with many very-old children can monopolise a
+             single tick's budget. Acceptable: next tick resumes with
+             whatever's left.
+
+        Failure handling:
+          * Transient archive failure → log + retry on the next sweep.
+          * Same child fails N consecutive times →
+            ``_retention_poison_pill_counts[child_id] >=
+            RETENTION_POISON_PILL_THRESHOLD`` engages and the child is
+            skipped in future sweeps (dashboard surfaces as "archive
+            failing" via Unit 13).
+          * Successful archive resets the poison-pill counter for that
+            child.
+
+        Backlog indicator:
+          ``self._retention_backlog_detected`` is set True whenever the
+          budget is exhausted, so Unit 13 can surface a "retention backlog
+          large — outside tested regime" banner.
+
+        Best-effort: never raises. The caller (``_tick``) wraps in a
+        try/except anyway.
+        """
+        if not self.cfg.schedules:
+            # No schedules configured → no templates → no children to sweep.
+            self._retention_backlog_detected = False
+            return
+        if not self._template_snapshots:
+            self._retention_backlog_detected = False
+            return
+
+        try:
+            client = self._ensure_linear_client()
+        except Exception as e:
+            logger.warning(f"Retention sweep: Linear client unavailable: {e}")
+            return
+
+        now = datetime.now(timezone.utc)
+        budget = RETENTION_BUDGET_PER_TICK
+        backlog_detected = False
+
+        for template_id, template in list(self._template_snapshots.items()):
+            if budget <= 0:
+                # Leftover work exists — signal to dashboard.
+                backlog_detected = True
+                break
+
+            schedule_cfg = self._resolve_schedule_config(template)
+            if schedule_cfg is None:
+                continue
+
+            retention_days = schedule_cfg.retention_days
+            if retention_days < 1:
+                continue
+
+            try:
+                children = await client.fetch_template_children(
+                    template_id, include_archived=False
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Retention sweep: failed to fetch children for "
+                    f"template={template.identifier}: {e}"
+                )
+                continue
+
+            candidates = select_retention_candidates(
+                children, now, retention_days,
+            )
+            # Skip poison-pilled children — they've failed repeatedly and
+            # would just re-burn budget every tick.
+            candidates = [
+                c for c in candidates
+                if self._retention_poison_pill_counts.get(c.id, 0)
+                < RETENTION_POISON_PILL_THRESHOLD
+            ]
+
+            if not candidates:
+                continue
+
+            # If this single template has more candidates than budget, we
+            # know there's a backlog even if nothing remains for other
+            # templates. The outer loop check catches the cross-template
+            # case; this catches the intra-template case.
+            if len(candidates) > budget:
+                backlog_detected = True
+
+            for child in candidates:
+                if budget <= 0:
+                    backlog_detected = True
+                    break
+                ok = False
+                try:
+                    ok = await client.archive_issue(child.id)
+                except Exception as e:
+                    logger.warning(
+                        f"Retention sweep: archive raised for "
+                        f"child={child.identifier} "
+                        f"template={template.identifier}: {e}"
+                    )
+                    ok = False
+
+                budget -= 1
+                if ok:
+                    # Success: clear any previous failure state for this
+                    # child; record wall-clock for dashboard.
+                    self._retention_poison_pill_counts.pop(child.id, None)
+                    self._retention_last_archive_at[child.id] = now
+                else:
+                    prior = self._retention_poison_pill_counts.get(child.id, 0)
+                    new_count = prior + 1
+                    self._retention_poison_pill_counts[child.id] = new_count
+                    if new_count == RETENTION_POISON_PILL_THRESHOLD:
+                        # Loud once, then silent on future sweeps.
+                        logger.warning(
+                            f"Retention sweep: poison pill engaged for "
+                            f"child={child.identifier} "
+                            f"template={template.identifier} "
+                            f"after {new_count} consecutive failures; "
+                            f"skipping in future sweeps"
+                        )
+
+        self._retention_backlog_detected = backlog_detected
 
     async def _tick(self):
         """Single poll tick: reconcile, validate, fetch, dispatch.
@@ -2903,6 +3181,15 @@ class Orchestrator:
                         f"Dispatch budget exhausted: project={slug} has "
                         f"{len(starved)} eligible but 0 running issues"
                     )
+
+        # Retention sweep. Runs LAST so the dispatch pass is never
+        # delayed by archive latency. Awaited (not fire-and-forget) so
+        # exceptions surface to the caller's normal per-tick error path
+        # and sweep timing is deterministic across ticks.
+        try:
+            await self._retention_sweep()
+        except Exception as e:
+            logger.error(f"Retention sweep failed: {e}", exc_info=True)
 
     async def _resolve_repo_for_coldstart(
         self,
