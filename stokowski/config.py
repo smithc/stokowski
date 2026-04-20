@@ -124,6 +124,40 @@ class LinearStatesConfig:
     gate_approved: str = "Gate Approved"
     rework: str = "Rework"
     terminal: list[str] = field(default_factory=lambda: ["Done", "Closed", "Cancelled"])
+    # Reserved schedule-template states (scheduled jobs feature).
+    schedule_scheduled: str = "Scheduled"
+    schedule_paused: str = "Paused"
+    schedule_trigger_now: str = "Trigger Now"
+    schedule_error: str = "Error"
+
+
+# Valid overlap policies for ScheduleConfig.overlap_policy
+_SCHEDULE_OVERLAP_POLICIES = ("skip", "queue", "cancel_previous", "parallel")
+# Valid workspace modes for ScheduleConfig.workspace_mode
+_SCHEDULE_WORKSPACE_MODES = ("ephemeral", "persistent")
+# Valid on_missed policies for ScheduleConfig.on_missed
+_SCHEDULE_ON_MISSED = ("skip", "run_once", "run_all")
+
+
+@dataclass
+class ScheduleConfig:
+    """A single schedule type — binds a workflow to an operator-facing policy set.
+
+    Schedules are declared in a ``schedules:`` block in workflow.yaml. Linear
+    issues carrying the ``schedule:<name>`` label are "templates" that
+    materialize a sub-issue on each cron fire. Cron and timezone are stored
+    on the template itself (Linear custom fields) — this config governs
+    policy only, not scheduling itself.
+    """
+    name: str = ""
+    workflow: str = ""
+    overlap_policy: str = "skip"  # one of _SCHEDULE_OVERLAP_POLICIES
+    workspace_mode: str = "ephemeral"  # one of _SCHEDULE_WORKSPACE_MODES
+    on_missed: str = "skip"  # one of _SCHEDULE_ON_MISSED
+    run_all_cap: int = 5
+    retention_days: int = 30
+    max_runtime_ms: int | None = None
+    timezone: str = "UTC"
 
 
 @dataclass
@@ -262,6 +296,7 @@ class ServiceConfig:
     # source YAML and a synthetic `_default` entry was generated for backward
     # compatibility. Operators should never set this field directly.
     repos_synthesized: bool = False
+    schedules: dict[str, ScheduleConfig] = field(default_factory=dict)
 
     def resolved_api_key(self) -> str:
         key = self.tracker.api_key
@@ -402,6 +437,19 @@ class ServiceConfig:
         """Return the terminal Linear state names."""
         return list(self.linear_states.terminal)
 
+    def schedule_template_linear_states(self) -> list[str]:
+        """Return the four reserved Linear state names used for schedule templates.
+
+        Order: scheduled, paused, trigger_now, error.
+        """
+        ls = self.linear_states
+        return [
+            ls.schedule_scheduled,
+            ls.schedule_paused,
+            ls.schedule_trigger_now,
+            ls.schedule_error,
+        ]
+
 
 def _resolve_linear_state_name(key: str, ls: LinearStatesConfig) -> str:
     """Resolve a logical state key to the actual Linear state name."""
@@ -412,6 +460,10 @@ def _resolve_linear_state_name(key: str, ls: LinearStatesConfig) -> str:
         "rework": ls.rework,
         "todo": ls.todo,
         "terminal": ls.terminal[0] if ls.terminal else "Done",
+        "schedule_scheduled": ls.schedule_scheduled,
+        "schedule_paused": ls.schedule_paused,
+        "schedule_trigger_now": ls.schedule_trigger_now,
+        "schedule_error": ls.schedule_error,
     }
     return mapping.get(key, key)
 
@@ -597,6 +649,10 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         gate_approved=str(ls_raw.get("gate_approved", "Gate Approved")),
         rework=str(ls_raw.get("rework", "Rework")),
         terminal=_coerce_list(ls_raw.get("terminal")) or ["Done", "Closed", "Cancelled"],
+        schedule_scheduled=str(ls_raw.get("schedule_scheduled", "Scheduled")),
+        schedule_paused=str(ls_raw.get("schedule_paused", "Paused")),
+        schedule_trigger_now=str(ls_raw.get("schedule_trigger_now", "Trigger Now")),
+        schedule_error=str(ls_raw.get("schedule_error", "Error")),
     )
 
     # Parse prompts
@@ -720,6 +776,27 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         )
         repos_synthesized = True
 
+    # Parse schedules
+    schedules_raw = config_raw.get("schedules", {}) or {}
+    schedules: dict[str, ScheduleConfig] = {}
+    for sched_name, sched_data in schedules_raw.items():
+        sd = sched_data or {}
+        schedules[sched_name] = ScheduleConfig(
+            name=sched_name,
+            workflow=str(sd.get("workflow", "")),
+            overlap_policy=str(sd.get("overlap_policy", "skip")),
+            workspace_mode=str(sd.get("workspace_mode", "ephemeral")),
+            on_missed=str(sd.get("on_missed", "skip")),
+            run_all_cap=_coerce_int(sd.get("run_all_cap"), 5),
+            retention_days=_coerce_int(sd.get("retention_days"), 30),
+            max_runtime_ms=(
+                _coerce_int(sd.get("max_runtime_ms"), 0)
+                if sd.get("max_runtime_ms") is not None
+                else None
+            ),
+            timezone=str(sd.get("timezone", "UTC")),
+        )
+
     cfg = ServiceConfig(
         tracker=tracker,
         polling=polling,
@@ -736,6 +813,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         workflows=workflows,
         repos=repos,
         repos_synthesized=repos_synthesized,
+        schedules=schedules,
     )
 
     return ParsedConfig(config=cfg, prompt_template=prompt_template)
@@ -761,7 +839,10 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
     is_legacy = len(cfg.workflows) == 1 and "_default" in cfg.workflows
 
     # Valid linear_state keys
-    valid_linear_keys = {"active", "review", "gate_approved", "rework", "terminal"}
+    valid_linear_keys = {
+        "active", "review", "gate_approved", "rework", "terminal",
+        "schedule_scheduled", "schedule_paused", "schedule_trigger_now", "schedule_error",
+    }
 
     has_agent = False
     has_terminal = False
@@ -886,7 +967,10 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
             errors.append(f"Workflow '{wf.name}' has an empty path")
 
         # Validate terminal_state key
-        valid_terminal_keys = {"terminal", "todo", "active", "review", "gate_approved", "rework"}
+        valid_terminal_keys = {
+            "terminal", "todo", "active", "review", "gate_approved", "rework",
+            "schedule_scheduled", "schedule_paused", "schedule_trigger_now", "schedule_error",
+        }
         if wf.terminal_state not in valid_terminal_keys:
             errors.append(
                 f"Workflow '{wf.name}' has invalid terminal_state: '{wf.terminal_state}' "
@@ -964,6 +1048,96 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         unreachable = all_state_names - reachable
         for name in unreachable:
             log.warning("State '%s' is unreachable (no transitions lead to it)", name)
+
+    # --- Schedule validation ---
+    if cfg.schedules:
+        # Reserved schedule state names must be non-empty
+        reserved_schedule_fields = {
+            "schedule_scheduled": cfg.linear_states.schedule_scheduled,
+            "schedule_paused": cfg.linear_states.schedule_paused,
+            "schedule_trigger_now": cfg.linear_states.schedule_trigger_now,
+            "schedule_error": cfg.linear_states.schedule_error,
+        }
+        for field_name, value in reserved_schedule_fields.items():
+            if not value:
+                errors.append(
+                    f"linear_states.{field_name} must be set when schedules are defined"
+                )
+
+        for sched_name, sc in cfg.schedules.items():
+            # workflow must reference an existing workflow
+            if not sc.workflow:
+                errors.append(
+                    f"Schedule '{sched_name}' is missing 'workflow' field"
+                )
+            elif sc.workflow not in cfg.workflows:
+                errors.append(
+                    f"Schedule '{sched_name}' references undefined workflow "
+                    f"'{sc.workflow}'"
+                )
+
+            # overlap_policy must be a valid literal
+            if sc.overlap_policy not in _SCHEDULE_OVERLAP_POLICIES:
+                errors.append(
+                    f"Schedule '{sched_name}' has invalid overlap_policy: "
+                    f"'{sc.overlap_policy}' "
+                    f"(valid: {', '.join(_SCHEDULE_OVERLAP_POLICIES)})"
+                )
+
+            # workspace_mode must be a valid literal (STRICT — no wildcard)
+            if sc.workspace_mode not in _SCHEDULE_WORKSPACE_MODES:
+                errors.append(
+                    f"Schedule '{sched_name}' has invalid workspace_mode: "
+                    f"'{sc.workspace_mode}' "
+                    f"(valid: {', '.join(_SCHEDULE_WORKSPACE_MODES)})"
+                )
+
+            # on_missed must be a valid literal
+            if sc.on_missed not in _SCHEDULE_ON_MISSED:
+                errors.append(
+                    f"Schedule '{sched_name}' has invalid on_missed: "
+                    f"'{sc.on_missed}' "
+                    f"(valid: {', '.join(_SCHEDULE_ON_MISSED)})"
+                )
+
+            # retention_days >= 1
+            if sc.retention_days < 1:
+                errors.append(
+                    f"Schedule '{sched_name}' retention_days must be >= 1 "
+                    f"(got {sc.retention_days})"
+                )
+
+            # timezone must resolve via zoneinfo (IANA strict)
+            tz_name = sc.timezone or "UTC"
+            try:
+                # Local import — zoneinfo is stdlib on Python 3.9+; Stokowski
+                # requires >=3.11 per pyproject.toml.
+                from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+                try:
+                    ZoneInfo(tz_name)
+                except ZoneInfoNotFoundError:
+                    errors.append(
+                        f"Schedule '{sched_name}' has invalid timezone: "
+                        f"'{tz_name}' (must be an IANA timezone name like "
+                        f"'UTC' or 'America/New_York')"
+                    )
+            except ImportError:  # pragma: no cover — zoneinfo is stdlib
+                errors.append(
+                    f"Schedule '{sched_name}': zoneinfo module is unavailable; "
+                    "cannot validate timezone"
+                )
+
+            # Soft warn: workflow with no label is only triggerable by default
+            # routing (scheduled children cannot carry a label to target it)
+            if sc.workflow and sc.workflow in cfg.workflows:
+                target_wf = cfg.workflows[sc.workflow]
+                if target_wf.label is None:
+                    log.warning(
+                        "Schedule '%s' references workflow '%s' which has no "
+                        "label — scheduled children can only reach it via "
+                        "default routing",
+                        sched_name, sc.workflow,
+                    )
 
     # Docker validation
     if cfg.docker.enabled:

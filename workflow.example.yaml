@@ -61,6 +61,13 @@ linear_states:
     - Cancelled
     - Canceled
     - Duplicate
+  # Reserved states for scheduled-job template issues. Templates live in
+  # these states (outside the normal dispatch pool) — children materialize
+  # into the usual active/review/terminal flow.
+  schedule_scheduled: "Scheduled"     # template is active; fires on its cron
+  schedule_paused: "Paused"           # template is paused; evaluator skips
+  schedule_trigger_now: "Trigger Now" # operator-requested out-of-band fire
+  schedule_error: "Error"             # template hit permanent failure; needs attention
 
 # ---------------------------------------------------------------------------
 # Polling
@@ -261,3 +268,37 @@ states:
   done:
     type: terminal
     linear_state: terminal
+
+# ---------------------------------------------------------------------------
+# Schedules (optional — scheduled-job templates)
+# ---------------------------------------------------------------------------
+#
+# Each entry declares a schedule *type*: a named policy set that binds a
+# cron-driven Linear "template" issue to one of the workflows above.
+#
+# Operators create a template issue in Linear, label it `schedule:<name>`,
+# set the cron expression + timezone via Linear custom fields, and move it
+# to the Scheduled state. On each cron fire, Stokowski materialises a
+# child sub-issue that flows through the referenced workflow normally.
+#
+# Fields:
+#   workflow        — name of an entry in `workflows:` (required)
+#   overlap_policy  — skip | queue | cancel_previous | parallel
+#   workspace_mode  — ephemeral | persistent
+#   on_missed       — skip | run_once | run_all
+#   run_all_cap     — max missed fires to catch up when on_missed=run_all
+#   retention_days  — days before terminal children are archived
+#   max_runtime_ms  — kill a child that exceeds this wall-clock budget
+#   timezone        — default IANA timezone if the template doesn't set one
+#
+# Uncomment and adapt for your own schedules:
+#
+# schedules:
+#   compound-refresh:
+#     workflow: full-ce
+#     overlap_policy: skip
+#     workspace_mode: ephemeral
+#     on_missed: skip
+#     retention_days: 30
+#     timezone: "America/New_York"
+schedules: {}
