@@ -14,6 +14,24 @@ STATE_PATTERN = re.compile(r"<!-- stokowski:state ({.*?}) -->")
 GATE_PATTERN = re.compile(r"<!-- stokowski:gate ({.*?}) -->")
 REJECTED_PATTERN = re.compile(r"<!-- stokowski:rejected ({.*?}) -->")
 MIGRATED_PATTERN = re.compile(r"<!-- stokowski:migrated ({.*?}) -->")
+FIRED_PATTERN = re.compile(r"<!-- stokowski:fired ({.*?}) -->")
+BOUNDED_DROP_PATTERN = re.compile(r"<!-- stokowski:bounded_drop ({.*?}) -->")
+SCHEDULE_ERROR_PATTERN = re.compile(r"<!-- stokowski:schedule_error ({.*?}) -->")
+
+# Known watermark status values (for reference; parsers accept anything for
+# forward compat, orchestrator is the canonical consumer).
+FIRED_STATUSES = frozenset(
+    {
+        "pending",
+        "child",
+        "failed",
+        "failed_permanent",
+        "skipped_overlap",
+        "skipped_bounded",
+        "skipped_paused",
+        "skipped_error",
+    }
+)
 
 
 def make_state_comment(
@@ -300,3 +318,302 @@ def get_comments_since(
         result.append(comment)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-job watermarks (stokowski:fired)
+# ---------------------------------------------------------------------------
+
+
+def make_fired_comment(
+    template_id: str,
+    slot: str,
+    status: str,
+    *,
+    child_id: str | None = None,
+    attempt: int | None = None,
+    reason: str | None = None,
+    seq: int | None = None,
+    timestamp: str | None = None,
+) -> str:
+    """Build a structured fire-watermark comment.
+
+    Posted on a template issue to mark progress through the fire protocol
+    for a given `slot`. Statuses: pending, child, failed, failed_permanent,
+    skipped_overlap, skipped_bounded, skipped_paused, skipped_error.
+
+    Parameters
+    ----------
+    template_id:
+        The template issue identifier (or id) this watermark belongs to.
+    slot:
+        Canonicalized slot key (ISO-8601 UTC for cron, `trigger:<id>` for
+        Trigger-Now).
+    status:
+        One of the values in `FIRED_STATUSES`.
+    child_id:
+        The created child issue identifier (set when status=="child").
+    attempt:
+        Retry counter (set when status in {"pending", "failed",
+        "failed_permanent"}).
+    reason:
+        Short machine-readable reason code (set on failure / skip).
+    seq:
+        Monotonic per-template counter for tie-breaking identical
+        timestamps. Orchestrator owns the counter; this function simply
+        embeds whatever value it is given.
+    timestamp:
+        Override the auto-generated UTC ISO-8601 timestamp (mostly useful
+        for tests).
+    """
+    payload: dict[str, Any] = {
+        "template": template_id,
+        "slot": slot,
+        "status": status,
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+    }
+    if child_id is not None:
+        payload["child"] = child_id
+    if attempt is not None:
+        payload["attempt"] = attempt
+    if reason is not None:
+        payload["reason"] = reason
+    if seq is not None:
+        payload["seq"] = seq
+
+    machine = f"<!-- stokowski:fired {json.dumps(payload)} -->"
+
+    # Human-readable line. Kept short; human reviewers mostly read the
+    # machine payload via dashboard, but Linear renders markdown so the
+    # line is useful in the comments timeline.
+    if status == "child" and child_id:
+        human = (
+            f"**[Stokowski]** Fire slot `{slot}`: created child "
+            f"**{child_id}**."
+        )
+    elif status == "pending":
+        attempt_txt = f" (attempt {attempt})" if attempt is not None else ""
+        human = (
+            f"**[Stokowski]** Fire slot `{slot}`: preparing child"
+            f"{attempt_txt}."
+        )
+    elif status == "failed":
+        attempt_txt = f" (attempt {attempt})" if attempt is not None else ""
+        reason_txt = f" reason: {reason}" if reason else ""
+        human = (
+            f"**[Stokowski]** Fire slot `{slot}`: failed{attempt_txt}."
+            f"{reason_txt}"
+        )
+    elif status == "failed_permanent":
+        reason_txt = f" reason: {reason}" if reason else ""
+        human = (
+            f"**[Stokowski]** Fire slot `{slot}`: permanently failed."
+            f"{reason_txt}"
+        )
+    elif status.startswith("skipped_"):
+        skip_kind = status[len("skipped_"):]
+        reason_txt = f" — {reason}" if reason else ""
+        human = (
+            f"**[Stokowski]** Fire slot `{slot}`: skipped "
+            f"({skip_kind}){reason_txt}."
+        )
+    else:
+        human = (
+            f"**[Stokowski]** Fire slot `{slot}`: status **{status}**."
+        )
+
+    return f"{machine}\n\n{human}"
+
+
+def _parse_fired_payload(body: str) -> dict[str, Any] | None:
+    """Return the parsed watermark JSON payload or None if not found/invalid."""
+    match = FIRED_PATTERN.search(body)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        logger.debug("Skipping malformed stokowski:fired payload")
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _fired_sort_key(entry: dict[str, Any], index: int) -> tuple:
+    """Sort key for watermark supersession.
+
+    Primary: timestamp (lexicographic ISO-8601 sort works when all entries
+    are UTC with the same precision; fall back to parsed datetime when
+    possible to tolerate mixed precisions).
+    Secondary: seq ascending (higher wins because we take the last).
+    Tertiary: input index (later-in-list wins → matches oldest-first
+    "last wins" convention).
+    """
+    ts = entry.get("timestamp", "")
+    ts_dt: datetime | None = None
+    if isinstance(ts, str) and ts:
+        try:
+            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            ts_dt = None
+    seq = entry.get("seq")
+    try:
+        seq_val = int(seq) if seq is not None else -1
+    except (TypeError, ValueError):
+        seq_val = -1
+    # Use epoch seconds when parseable; otherwise fall back to the raw
+    # string which still gives a stable relative ordering for identically
+    # formatted timestamps.
+    ts_key: tuple
+    if ts_dt is not None:
+        ts_key = (0, ts_dt.timestamp())
+    else:
+        ts_key = (1, ts if isinstance(ts, str) else "")
+    return (ts_key, seq_val, index)
+
+
+def parse_latest_fired(comments: list[dict]) -> dict[str, Any] | None:
+    """Return the latest fire watermark across all slots for this template.
+
+    Comments are assumed oldest-first (Linear `orderBy: createdAt`).
+    Uses timestamp → seq → input-order tiebreak so that two watermarks
+    written in the same millisecond are ordered by their monotonic `seq`.
+    Returns None if no watermark comments are present.
+    """
+    entries: list[tuple[tuple, dict[str, Any]]] = []
+    for index, comment in enumerate(comments):
+        body = comment.get("body", "") if isinstance(comment, dict) else ""
+        if not body:
+            continue
+        payload = _parse_fired_payload(body)
+        if payload is None:
+            continue
+        entries.append((_fired_sort_key(payload, index), payload))
+
+    if not entries:
+        return None
+    entries.sort(key=lambda item: item[0])
+    return entries[-1][1]
+
+
+def parse_fired_by_slot(comments: list[dict]) -> dict[str, dict[str, Any]]:
+    """Return `{slot: latest_watermark}` for every slot seen in comments.
+
+    Comments are assumed oldest-first; per-slot tiebreak uses the same
+    timestamp → seq → input-index ordering as `parse_latest_fired`.
+    Watermarks without a `slot` field are ignored. An empty input returns
+    an empty dict.
+    """
+    per_slot: dict[str, list[tuple[tuple, dict[str, Any]]]] = {}
+    for index, comment in enumerate(comments):
+        body = comment.get("body", "") if isinstance(comment, dict) else ""
+        if not body:
+            continue
+        payload = _parse_fired_payload(body)
+        if payload is None:
+            continue
+        slot = payload.get("slot")
+        if not isinstance(slot, str) or not slot:
+            continue
+        per_slot.setdefault(slot, []).append(
+            (_fired_sort_key(payload, index), payload)
+        )
+
+    result: dict[str, dict[str, Any]] = {}
+    for slot, entries in per_slot.items():
+        entries.sort(key=lambda item: item[0])
+        result[slot] = entries[-1][1]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Bounded-drop surface (I5)
+# ---------------------------------------------------------------------------
+
+
+def make_bounded_drop_comment(
+    template_id: str,
+    dropped_count: int,
+    earliest_slot: str,
+    latest_slot: str,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Build a bounded-drop surface comment.
+
+    Posted when `on_missed: run_all` exceeds the configured cap and the
+    orchestrator had to discard the earliest missed slots.
+    """
+    payload: dict[str, Any] = {
+        "template": template_id,
+        "dropped_count": dropped_count,
+        "earliest_slot": earliest_slot,
+        "latest_slot": latest_slot,
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+    }
+    machine = f"<!-- stokowski:bounded_drop {json.dumps(payload)} -->"
+    human = (
+        f"**[Stokowski]** Dropped **{dropped_count}** missed fire slots "
+        f"(from `{earliest_slot}` through `{latest_slot}`) after exceeding "
+        f"the run_all backfill cap."
+    )
+    return f"{machine}\n\n{human}"
+
+
+# ---------------------------------------------------------------------------
+# Schedule-error surface (R18)
+# ---------------------------------------------------------------------------
+
+
+def make_schedule_error_comment(
+    template_id: str,
+    reason: str,
+    details: str | None = None,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Build a schedule-error comment posted when a template is moved to Error.
+
+    Idempotent callers consult `parse_latest_schedule_error` and only post
+    on a distinct `reason`.
+    """
+    payload: dict[str, Any] = {
+        "template": template_id,
+        "reason": reason,
+        "details": details,
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+    }
+    machine = f"<!-- stokowski:schedule_error {json.dumps(payload)} -->"
+    if details:
+        human = (
+            f"**[Stokowski]** Schedule error (`{reason}`): {details}"
+        )
+    else:
+        human = f"**[Stokowski]** Schedule error: `{reason}`."
+    return f"{machine}\n\n{human}"
+
+
+def parse_latest_schedule_error(
+    comments: list[dict],
+) -> dict[str, Any] | None:
+    """Return the latest schedule-error comment payload, or None.
+
+    Oldest-first "last wins" scan, matching `parse_latest_tracking`.
+    """
+    latest: dict[str, Any] | None = None
+    for comment in comments:
+        body = comment.get("body", "") if isinstance(comment, dict) else ""
+        if not body:
+            continue
+        match = SCHEDULE_ERROR_PATTERN.search(body)
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            logger.debug("Skipping malformed stokowski:schedule_error payload")
+            continue
+        if isinstance(data, dict):
+            latest = data
+    return latest
