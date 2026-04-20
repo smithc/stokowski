@@ -50,13 +50,29 @@ from .prompt import (
 from .runner import run_agent_turn, run_turn
 from .tracking import (
     has_pending_rejection,
+    make_bounded_drop_comment,
+    make_fired_comment,
     make_gate_comment,
     make_migrated_comment,
     make_rejection_comment,
+    make_schedule_error_comment,
     make_state_comment,
+    parse_fired_by_slot,
     parse_latest_tracking,
 )
 from .workspace import ensure_workspace, remove_workspace, sanitize_key
+from . import scheduler
+from ._fire_helpers import (
+    MAX_FIRE_ATTEMPTS,
+    build_child_description,
+    build_child_title,
+    decide_materialize_step,
+    find_existing_child_for_slot,
+    max_seq_from_parsed,
+    slot_label_name,
+    watermarks_from_parsed,
+    workflow_label_name,
+)
 
 logger = logging.getLogger("stokowski")
 
@@ -237,6 +253,7 @@ class Orchestrator:
         self._template_watermark_seq: dict[str, int] = {}                 # template_id -> next seq counter value
         self._template_fire_attempts: dict[tuple[str, str], int] = {}     # (template_id, slot) -> attempt counter
         self._template_next_fire_at: dict[str, datetime] = {}             # template_id -> computed next-fire time (dashboard, Unit 13)
+        self._template_seq_seeded: set[str] = set()                       # template_ids whose seq counter was rehydrated from Linear this process lifetime
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -573,6 +590,7 @@ class Orchestrator:
         self._template_error_since.pop(template_id, None)
         self._template_watermark_seq.pop(template_id, None)
         self._template_next_fire_at.pop(template_id, None)
+        self._template_seq_seeded.discard(template_id)
         # Per-slot fire-attempt entries are keyed by (template_id, slot).
         for key in list(self._template_fire_attempts):
             if key[0] == template_id:
@@ -1557,6 +1575,648 @@ class Orchestrator:
         self._templates = {t.id for t in templates}
         self._template_snapshots = {t.id: t for t in templates}
 
+    # ------------------------------------------------------------------
+    # Scheduled-jobs evaluator + fire materialization (Unit 6)
+    # ------------------------------------------------------------------
+
+    def _next_seq(self, template_id: str) -> int:
+        """Return the next watermark ``seq`` for ``template_id`` (1-indexed).
+
+        Monotonic per template. Used as the intra-millisecond tiebreak on
+        watermark supersession; the authoritative ordering is still the
+        comment timestamp assigned by Linear.
+        """
+        n = self._template_watermark_seq.get(template_id, 0) + 1
+        self._template_watermark_seq[template_id] = n
+        return n
+
+    def _resolve_schedule_name(self, template: Issue) -> str | None:
+        """Return the schedule-type name encoded in the template's labels.
+
+        A template carries exactly one ``schedule:<name>`` label (Unit 5
+        validates this via ``detect_duplicate_label``). Returns the bare
+        ``<name>`` portion, lowercased to match how labels are stored.
+        Returns None if no schedule label is present.
+        """
+        for label in (template.labels or []):
+            ll = (label or "").lower()
+            if ll.startswith("schedule:"):
+                name = ll[len("schedule:"):]
+                if name:
+                    return name
+        return None
+
+    def _resolve_schedule_config(
+        self, template: Issue
+    ) -> "ScheduleConfig | None":  # noqa: F821 — forward ref
+        """Look up the ScheduleConfig for a template, with case-insensitive match.
+
+        Config keys in ``self.cfg.schedules`` preserve operator casing;
+        labels in Linear are normalized to lowercase on fetch. We retry
+        with lowercase keys so a ``schedule:daily_report`` label matches
+        a ``daily_report`` config block regardless of casing.
+        """
+        name = self._resolve_schedule_name(template)
+        if not name:
+            return None
+        schedules = self.cfg.schedules
+        if name in schedules:
+            return schedules[name]
+        # Case-insensitive fallback — Linear lowercases labels.
+        for key, sc in schedules.items():
+            if key.lower() == name.lower():
+                return sc
+        return None
+
+    async def _seed_seq_from_linear(
+        self, template: Issue, comments: list[dict] | None = None
+    ) -> None:
+        """One-shot rehydrate ``_template_watermark_seq`` from Linear comments.
+
+        Invoked the first time we see a template in this process lifetime
+        so restart doesn't reset seq to 0 (which would briefly tie new
+        watermarks with pre-restart ones during supersession). Fetches
+        comments only if the caller didn't already.
+        """
+        if template.id in self._template_seq_seeded:
+            return
+        try:
+            if comments is None:
+                client = self._ensure_linear_client()
+                comments = await client.fetch_comments(template.id)
+            parsed = parse_fired_by_slot(comments or [])
+            seeded = max_seq_from_parsed(parsed)
+            if seeded > self._template_watermark_seq.get(template.id, 0):
+                self._template_watermark_seq[template.id] = seeded
+        except Exception as e:
+            # Best-effort; a fresh seq counter is safe, just not optimal.
+            logger.debug(
+                f"seq seeding failed for {template.identifier}: {e}"
+            )
+        finally:
+            self._template_seq_seeded.add(template.id)
+
+    async def _safe_evaluate_schedules(self) -> None:
+        """Wrapper matching the ``_safe_transition`` pattern at line ~700.
+
+        Per-template evaluator failures must NOT abort the whole pass —
+        those are caught inside ``_evaluate_schedules``. This wrapper
+        catches only unexpected exceptions around the loop itself.
+        """
+        try:
+            await self._evaluate_schedules()
+        except Exception as e:
+            logger.error(f"Schedule evaluator pass failed: {e}", exc_info=True)
+
+    async def _evaluate_schedules(self) -> None:
+        """Per-tick schedule evaluation + fire materialization.
+
+        Runs AFTER ``_handle_gate_responses`` and BEFORE
+        ``fetch_candidate_issues`` in ``_tick`` so children created here
+        are picked up by the same tick's dispatch pass — avoids a full
+        poll interval of latency.
+
+        Pipeline per template:
+          1. Build a ``TemplateSnapshot`` for the pure evaluator.
+          2. Seed seq counter on first sight (rehydrate from Linear).
+          3. Fetch fire-watermark comments; parse via ``parse_fired_by_slot``.
+          4. Count in-flight children from ``self._template_children``.
+          5. Call ``scheduler.evaluate_template(...)`` → list of decisions.
+          6. Route each decision to ``_materialize_fire`` or
+             ``_post_skip_watermark``.
+          7. Apply ``detect_duplicate_label`` across all templates; move
+             losers to Error.
+
+        Evaluator or Linear errors for one template are logged and do not
+        abort the pass.
+        """
+        if not self.cfg.schedules:
+            return
+        if not self._template_snapshots:
+            return
+
+        client = self._ensure_linear_client()
+        now = datetime.now(timezone.utc)
+
+        # Build TemplateSnapshots for duplicate-label detection. Run this
+        # first so losers are moved to Error before we waste API calls
+        # fetching their comments / firing them.
+        all_snapshots: list[scheduler.TemplateSnapshot] = []
+        snapshot_by_id: dict[str, scheduler.TemplateSnapshot] = {}
+        for tmpl in self._template_snapshots.values():
+            snap = scheduler.TemplateSnapshot(
+                id=tmpl.id,
+                identifier=tmpl.identifier,
+                linear_state=tmpl.state or "",
+                cron_expr=tmpl.cron_expr or "",
+                timezone=tmpl.timezone or "UTC",
+                labels=tuple(tmpl.labels or ()),
+                created_at=tmpl.created_at,
+            )
+            all_snapshots.append(snap)
+            snapshot_by_id[tmpl.id] = snap
+
+        try:
+            winners, losers = scheduler.detect_duplicate_label(all_snapshots)
+        except Exception as e:
+            logger.error(f"detect_duplicate_label failed: {e}", exc_info=True)
+            winners, losers = all_snapshots, []
+
+        loser_ids = {l.id for l in losers}
+        for loser_snap in losers:
+            tmpl = self._template_snapshots.get(loser_snap.id)
+            if tmpl is None:
+                continue
+            await self._move_template_to_error(
+                tmpl, reason="duplicate_schedule_label",
+                details=f"duplicate schedule label on {tmpl.identifier}",
+            )
+
+        # Per-template eval loop.
+        for template_id, template in list(self._template_snapshots.items()):
+            if template_id in loser_ids:
+                continue
+            snap = snapshot_by_id.get(template_id)
+            if snap is None:
+                continue
+
+            schedule_cfg = self._resolve_schedule_config(template)
+            if schedule_cfg is None:
+                # No matching schedule in config — likely a stale label
+                # that no longer maps to a config block. Surface once and
+                # move the template to Error so the operator notices.
+                await self._move_template_to_error(
+                    template,
+                    reason="schedule_type_removed",
+                    details=(
+                        f"template label does not match any configured "
+                        f"schedule; label is probably stale after a "
+                        f"workflow.yaml edit"
+                    ),
+                )
+                continue
+
+            # Cron + timezone must be present. If either is missing the
+            # evaluator would raise; surface as a schedule-error instead.
+            if not snap.cron_expr or not snap.timezone:
+                await self._move_template_to_error(
+                    template,
+                    reason="missing_cron_or_timezone",
+                    details=(
+                        f"template {template.identifier} is missing cron "
+                        f"expression or timezone custom field"
+                    ),
+                )
+                continue
+
+            # One-shot seq seeding + comment fetch. We fetch comments
+            # every tick here — the watermark scan needs them anyway.
+            try:
+                comments = await client.fetch_comments(template_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch comments for template "
+                    f"{template.identifier}: {e}"
+                )
+                continue
+            await self._seed_seq_from_linear(template, comments)
+
+            parsed = parse_fired_by_slot(comments or [])
+            watermarks = watermarks_from_parsed(parsed, template_id)
+
+            in_flight = len(self._template_children.get(template_id, set()))
+
+            try:
+                decisions = scheduler.evaluate_template(
+                    snap,
+                    watermarks,
+                    in_flight,
+                    now,
+                    schedule_cfg,
+                )
+            except scheduler.CronParseError as e:
+                await self._move_template_to_error(
+                    template, reason="cron_parse_error", details=str(e),
+                )
+                continue
+            except scheduler.TimezoneError as e:
+                await self._move_template_to_error(
+                    template, reason="timezone_error", details=str(e),
+                )
+                continue
+            except Exception as e:
+                logger.error(
+                    f"Evaluator raised for template "
+                    f"{template.identifier}: {e}",
+                    exc_info=True,
+                )
+                continue
+
+            for decision in decisions:
+                try:
+                    if decision.action == "fire":
+                        await self._materialize_fire(template, decision)
+                    else:
+                        await self._post_skip_watermark(template, decision)
+                except Exception as e:
+                    logger.error(
+                        f"Fire materialization failed for "
+                        f"template={template.identifier} slot={decision.slot} "
+                        f"action={decision.action}: {e}",
+                        exc_info=True,
+                    )
+
+    async def _post_skip_watermark(
+        self, template: Issue, decision: "scheduler.FireDecision"  # noqa: F821
+    ) -> None:
+        """Post a terminal skip watermark. No child is created.
+
+        For ``skip_bounded`` with a non-zero drop count we also post the
+        aggregate ``bounded_drop`` comment — but only on the first
+        dropped slot of the batch, per the evaluator's convention of
+        embedding the aggregate on the earliest decision.
+        """
+        action_to_status = {
+            "skip_overlap": "skipped_overlap",
+            "skip_bounded": "skipped_bounded",
+            "skip_paused": "skipped_paused",
+            "skip_error": "skipped_error",
+        }
+        status = action_to_status.get(decision.action)
+        if status is None:
+            logger.debug(
+                f"Unknown skip action {decision.action} for "
+                f"{template.identifier}; ignoring"
+            )
+            return
+
+        client = self._ensure_linear_client()
+        seq = self._next_seq(template.id)
+        body = make_fired_comment(
+            template_id=template.identifier,
+            slot=decision.slot,
+            status=status,
+            reason=decision.reason,
+            seq=seq,
+        )
+        await client.post_comment(template.id, body)
+        logger.info(
+            f"Skip watermark template={template.identifier} "
+            f"slot={decision.slot} status={status} "
+            f"reason={decision.reason}"
+        )
+
+        if decision.action == "skip_bounded" and decision.bounded_dropped_count > 0:
+            try:
+                drop_body = make_bounded_drop_comment(
+                    template_id=template.identifier,
+                    dropped_count=decision.bounded_dropped_count,
+                    earliest_slot=decision.bounded_drop_earliest or decision.slot,
+                    latest_slot=decision.bounded_drop_latest or decision.slot,
+                )
+                await client.post_comment(template.id, drop_body)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to post bounded_drop comment for "
+                    f"{template.identifier}: {e}"
+                )
+
+    async def _materialize_fire(
+        self, template: Issue, decision: "scheduler.FireDecision"  # noqa: F821
+    ) -> None:
+        """Materialize a ``fire`` decision into a Linear child issue.
+
+        Implements the R20 idempotency protocol (step order is load-bearing):
+
+            1. Duplicate-sibling check FIRST. If a child already carries
+               the ``slot:<canonical>`` label, post
+               ``status=child id=<existing>`` and return. This recovers
+               from crash-between-create-and-watermark-update without
+               posting an orphan pending.
+            2. Post ``pending attempt=<n>`` watermark.
+            3. Create the child via ``create_child_issue``.
+            4. On success: post ``status=child id=<new>`` watermark +
+               clear the fire-attempt counter.
+            5. On transient failure: post ``status=failed attempt=<n>
+               reason=<code>`` + increment the fire-attempt counter.
+            6. On permanent failure OR attempts >= MAX: post
+               ``status=failed_permanent reason=<code>`` and move the
+               template to Error.
+
+        Recovery semantics:
+
+          * Crash between step 1 and step 2 (no watermark, no child):
+            next tick evaluator re-decides; idempotent.
+          * Crash between step 2 and step 3 (pending watermark, no child):
+            next tick's step 1 finds no sibling, step 3 re-runs with
+            incremented attempt counter.
+          * Crash between step 3 and step 4 (child exists, watermark
+            still pending): next tick's step 1 finds the sibling and
+            promotes the watermark directly — no duplicate created.
+          * Crash between step 5 and next tick: state is as-intended;
+            retry proceeds.
+        """
+        client = self._ensure_linear_client()
+        slot = decision.slot
+        key = (template.id, slot)
+        attempts_before = self._template_fire_attempts.get(key, 0)
+
+        # --- Step 1: duplicate-sibling check ----------------------------
+        try:
+            siblings = await client.fetch_template_children(
+                template.id, include_archived=False
+            )
+        except Exception as e:
+            logger.warning(
+                f"fetch_template_children failed for "
+                f"{template.identifier}: {e}; skipping this fire"
+            )
+            return
+
+        active_siblings = [
+            c for c in siblings
+            if c.archived_at is None
+            and (c.state_type or "").lower() not in ("completed", "canceled")
+        ]
+
+        existing = find_existing_child_for_slot(active_siblings, slot)
+        if existing is not None:
+            seq = self._next_seq(template.id)
+            body = make_fired_comment(
+                template_id=template.identifier,
+                slot=slot,
+                status="child",
+                child_id=existing.identifier or existing.id,
+                seq=seq,
+            )
+            await client.post_comment(template.id, body)
+            # Populate reverse-index so subsequent ticks don't re-create.
+            self._template_children.setdefault(template.id, set()).add(existing.id)
+            self._child_to_template[existing.id] = template.id
+            self._template_fire_attempts.pop(key, None)
+            logger.info(
+                f"Fire dedup template={template.identifier} slot={slot} "
+                f"child={existing.identifier or existing.id} "
+                f"(duplicate-sibling recovery)"
+            )
+            return
+
+        step = decide_materialize_step(
+            decision, active_siblings, attempts_before
+        )
+
+        # --- Step 6 fast path: over retry budget -----------------------
+        if step.kind == "fail_permanent":
+            seq = self._next_seq(template.id)
+            body = make_fired_comment(
+                template_id=template.identifier,
+                slot=slot,
+                status="failed_permanent",
+                reason="attempts_exceeded",
+                attempt=attempts_before,
+                seq=seq,
+            )
+            try:
+                await client.post_comment(template.id, body)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to post failed_permanent watermark for "
+                    f"{template.identifier}: {e}"
+                )
+            self._template_fire_attempts.pop(key, None)
+            await self._move_template_to_error(
+                template,
+                reason="fire_failed_permanent",
+                details=(
+                    f"slot {slot} exhausted {MAX_FIRE_ATTEMPTS} fire "
+                    f"attempts"
+                ),
+            )
+            return
+
+        # --- Step 2: post pending watermark -----------------------------
+        attempt_n = step.attempt_number
+        pending_seq = self._next_seq(template.id)
+        pending_body = make_fired_comment(
+            template_id=template.identifier,
+            slot=slot,
+            status="pending",
+            attempt=attempt_n,
+            seq=pending_seq,
+        )
+        try:
+            await client.post_comment(template.id, pending_body)
+        except Exception as e:
+            logger.warning(
+                f"Failed to post pending watermark for "
+                f"{template.identifier} slot={slot}: {e}; next tick will "
+                f"retry from step 1"
+            )
+            return
+
+        # --- Step 3: create child ---------------------------------------
+        schedule_cfg = self._resolve_schedule_config(template)
+        schedule_name = schedule_cfg.name if schedule_cfg else None
+
+        # Pre-resolve labels. If any label isn't found we skip it (don't
+        # auto-create) and log a warning — operator is responsible for
+        # creating schedule / slot labels up front.
+        desired_labels: list[str] = []
+        if schedule_name:
+            desired_labels.append(workflow_label_name(schedule_name))
+        desired_labels.append(slot_label_name(slot))
+
+        label_ids: list[str] = []
+        try:
+            resolved = await client.resolve_label_ids(
+                template.team_id, desired_labels,
+            )
+        except Exception as e:
+            logger.warning(
+                f"resolve_label_ids failed for {template.identifier}: {e}; "
+                f"proceeding without label IDs"
+            )
+            resolved = {}
+
+        for name in desired_labels:
+            if name in resolved:
+                label_ids.append(resolved[name])
+            else:
+                logger.warning(
+                    f"Label {name!r} not found in team {template.team_id!r}; "
+                    f"child for slot {slot} will not carry it. Create the "
+                    f"label in Linear to enable duplicate-sibling detection."
+                )
+
+        title = build_child_title(template.title, slot)
+        description = build_child_description(
+            template_identifier=template.identifier,
+            template_url=template.url,
+            slot=slot,
+            cron_expr=template.cron_expr,
+            schedule_name=schedule_name,
+            is_trigger=decision.is_trigger_now,
+        )
+
+        team_id = template.team_id or ""
+        created: Issue | None = None
+        error_reason: str | None = None
+        try:
+            if not team_id:
+                error_reason = "missing_team_id"
+            else:
+                created = await client.create_child_issue(
+                    parent_id=template.id,
+                    team_id=team_id,
+                    title=title,
+                    description=description,
+                    label_ids=label_ids or None,
+                )
+                if created is None:
+                    error_reason = "create_rejected"
+        except Exception as e:
+            error_reason = f"create_exception:{type(e).__name__}"
+            logger.warning(
+                f"create_child_issue raised for {template.identifier} "
+                f"slot={slot}: {e}"
+            )
+
+        # --- Step 4: success ------------------------------------------
+        if created is not None and error_reason is None:
+            success_seq = self._next_seq(template.id)
+            success_body = make_fired_comment(
+                template_id=template.identifier,
+                slot=slot,
+                status="child",
+                child_id=created.identifier or created.id,
+                seq=success_seq,
+            )
+            try:
+                await client.post_comment(template.id, success_body)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to post success watermark for "
+                    f"{template.identifier} slot={slot}: {e}; next tick's "
+                    f"duplicate check will self-heal"
+                )
+            # Register the child for reverse-index + in-flight counting.
+            self._template_children.setdefault(template.id, set()).add(created.id)
+            self._child_to_template[created.id] = template.id
+            self._template_fire_attempts.pop(key, None)
+            self._template_last_fired[template.id] = datetime.now(timezone.utc)
+            logger.info(
+                f"Fire success template={template.identifier} slot={slot} "
+                f"child={created.identifier or created.id} attempt={attempt_n}"
+            )
+            return
+
+        # --- Steps 5/6: failure ---------------------------------------
+        new_attempts = attempts_before + 1
+        self._template_fire_attempts[key] = new_attempts
+
+        if new_attempts >= MAX_FIRE_ATTEMPTS:
+            # Permanent failure — post failed_permanent + Error transition.
+            fail_seq = self._next_seq(template.id)
+            fail_body = make_fired_comment(
+                template_id=template.identifier,
+                slot=slot,
+                status="failed_permanent",
+                reason=error_reason or "unknown",
+                attempt=new_attempts,
+                seq=fail_seq,
+            )
+            try:
+                await client.post_comment(template.id, fail_body)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to post failed_permanent watermark for "
+                    f"{template.identifier}: {e}"
+                )
+            self._template_fire_attempts.pop(key, None)
+            await self._move_template_to_error(
+                template,
+                reason="fire_failed_permanent",
+                details=(
+                    f"slot {slot} exhausted {MAX_FIRE_ATTEMPTS} fire "
+                    f"attempts (last reason: {error_reason})"
+                ),
+            )
+            logger.error(
+                f"Fire failed_permanent template={template.identifier} "
+                f"slot={slot} attempts={new_attempts} reason={error_reason}"
+            )
+            return
+
+        # Transient failure — post failed watermark, keep attempt counter.
+        fail_seq = self._next_seq(template.id)
+        fail_body = make_fired_comment(
+            template_id=template.identifier,
+            slot=slot,
+            status="failed",
+            reason=error_reason or "unknown",
+            attempt=new_attempts,
+            seq=fail_seq,
+        )
+        try:
+            await client.post_comment(template.id, fail_body)
+        except Exception as e:
+            logger.warning(
+                f"Failed to post failed watermark for "
+                f"{template.identifier}: {e}"
+            )
+        logger.warning(
+            f"Fire failed template={template.identifier} slot={slot} "
+            f"attempt={new_attempts} reason={error_reason}"
+        )
+
+    async def _move_template_to_error(
+        self,
+        template: Issue,
+        *,
+        reason: str,
+        details: str | None = None,
+    ) -> None:
+        """Move a template to the Error Linear state + post a schedule_error comment.
+
+        Unit 10 replaces this stub with fuller semantics (idempotency on
+        ``reason``, suppression of duplicate posts). For Unit 6 we keep
+        it simple: post the comment + call ``update_issue_state``.
+        Records ``_template_error_since`` so Unit 10 can measure dwell.
+        """
+        try:
+            client = self._ensure_linear_client()
+            body = make_schedule_error_comment(
+                template_id=template.identifier,
+                reason=reason,
+                details=details,
+            )
+            try:
+                await client.post_comment(template.id, body)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to post schedule_error comment for "
+                    f"{template.identifier}: {e}"
+                )
+            error_state = self.cfg.linear_states.schedule_error
+            try:
+                await client.update_issue_state(template.id, error_state)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to move {template.identifier} to "
+                    f"{error_state!r}: {e}"
+                )
+            self._template_error_since[template.id] = datetime.now(timezone.utc)
+            logger.error(
+                f"Template moved to Error template={template.identifier} "
+                f"reason={reason} details={details!r}"
+            )
+        except Exception as e:
+            logger.error(
+                f"_move_template_to_error failed for "
+                f"{template.identifier}: {e}",
+                exc_info=True,
+            )
+
     async def _tick(self):
         """Single poll tick: reconcile, validate, fetch, dispatch.
 
@@ -1584,6 +2244,11 @@ class Orchestrator:
         if not self.configs:
             logger.warning("No healthy projects loaded, skipping dispatch")
             return
+
+        # Part 2.5: Evaluate schedules. Children materialized here are
+        # picked up by this same tick's candidate fetch below — avoids a
+        # full poll interval of latency between fire and dispatch.
+        await self._safe_evaluate_schedules()
 
         # Part 3: Fetch candidates — per project, with its own client.
         all_candidates: list[Issue] = []
