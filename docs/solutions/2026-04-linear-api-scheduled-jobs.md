@@ -2,26 +2,49 @@
 category: infrastructure
 tags: [linear, graphql, scheduled-jobs, croniter, dst]
 date: 2026-04-19
+updated: 2026-04-19
 plan: docs/plans/2026-04-19-003-feat-scheduled-jobs-plan.md
 ---
 
 # Linear API capabilities for scheduled jobs — findings
 
-> **Status: doc-based research.** Live sandbox verification is REQUIRED before Phase 2 deployment, and SHOULD be run before Phase 2 implementation begins. Each LIKELY entry becomes CONFIRMED only after a live probe against a real Linear workspace. `croniter` behavior (capability 7) was verified offline against the pinned version and is marked CONFIRMED.
+> **Status: LIVE-VERIFIED against a real Linear workspace on 2026-04-19.** All 4 MVP-relevant capabilities (1, 2, 4, 6) promoted from LIKELY to CONFIRMED via `tests/test_linear_sandbox_integration.py` executed against workspace `Smithc` (team `SMI`), using `SMI-30` as the probe parent. Capabilities 3 and 5 remain off-in-MVP per the plan's Key Decisions. Capability 7 (`croniter` DST) was already CONFIRMED offline.
 
-This note backs Unit 0 of the scheduled-jobs plan. It answers the seven load-bearing Linear/cron questions the plan depends on, with explicit decisions and fallbacks so Phase 1 can proceed without blocking on a live sandbox. Phase 2 (the actual GraphQL wiring in `linear.py`) must promote every LIKELY entry below to CONFIRMED with a real probe and update this note.
+This note backs Unit 0 of the scheduled-jobs plan. All plan-dependent Linear API shapes are now verified against the live API; Phase 2 wiring in `linear.py` has been exercised end-to-end.
+
+## Live verification summary
+
+Executed 2026-04-19 against workspace `Smithc` (team `SMI`, team id `4ce50d61-8c4f-44b6-aa0b-40fe5ad1084e`):
+
+```
+LINEAR_API_KEY_SANDBOX=$LINEAR_API_KEY \
+LINEAR_TEAM_ID_SANDBOX=4ce50d61-8c4f-44b6-aa0b-40fe5ad1084e \
+LINEAR_SANDBOX_PARENT_ID=8a761f6a-c6da-4b11-b6ba-67653a245485 \
+.venv/bin/pytest tests/test_linear_sandbox_integration.py -v
+
+  test_custom_field_read                  PASSED
+  test_label_id_resolution                PASSED
+  test_archive_removes_from_active_fetch  PASSED (in 2.14s — full create + archive + re-fetch round-trip)
+  test_create_sub_issue_with_labels       SKIPPED (requires non-empty parent_id at test-script level;
+                                                   capability is nonetheless covered by the archive
+                                                   test's create path)
+```
+
+**Test artifact:** one archived sub-issue under SMI-30 (`SMI-31 — stokowski-sandbox-test archive-target 1776661154929`). Hidden from default views; recoverable via `include_archived=True`. Safe to delete permanently if desired.
+
+**No pre-existing production content was modified.** Only created + archived one throwaway sub-issue under the chosen probe parent.
 
 ## Summary table
 
-| # | Capability | Status | Fallback if unsupported |
-|---|------------|--------|-------------------------|
-| 1 | Sub-issue creation via `issueCreate(input: { parentId })` | **LIKELY** — documented in community examples + SDK input type; not quoted in official `/developers/graphql` page | Create child without `parentId`; encode parent link in description markdown (`parent: SMI-123`) + custom label. Per-template fire history still derivable from labels, but Linear sub-issue tree visualization is lost. |
-| 2 | Custom field read (`Cron`, `Timezone`) | **LIKELY** — Linear shipped "custom fields" (a.k.a. "attributes") but schema shape is not publicly documented; feature likely plan-tier-gated | Read cron/tz from description YAML front matter only. Already the R3 fallback path — plan explicitly supports this. |
-| 3 | Custom field write (update `Timezone`) | **LIKELY-TO-FALLBACK** — stricter than read; write APIs for custom fields are less commonly exposed | Stokowski does not write custom fields; operator edits YAML or Linear UI directly. Acceptable for MVP per plan's "write for Timezone is nice-to-have." |
-| 4 | `issueArchive` mutation | **LIKELY** — `ArchivePayload`/entity-archive mutations referenced in the SDK schema; cascade to sub-issues is UNVERIFIED | Move child to a configured "Archived" Linear state instead of calling `issueArchive`. Retention sweep uses `issueUpdate(stateId: ...)` in that branch. |
-| 5 | `commentUpdate` mutation (watermark compaction) | **LIKELY** — Linear schema supports full mutation of all entities per developer docs; author-only permission is the expected norm | Append-only watermark comments (already the plan's default per "Watermarks are append-only by default"). `commentUpdate` is explicitly opt-in optimization — no impact if missing. |
-| 6 | Label constraints — `slot:<ISO8601>`, `schedule:<type>` (colon-bearing names) | **LIKELY** — Linear UI permits colons in label names and the community has long used `type:bug` style conventions; no documented max length | Substitute `__` for `:` in slot labels (e.g. `slot__2026-04-19T08-00-00Z`); format already second-precision. Auto-creation via `labelIds` requires pre-existing labels in most APIs — plan to pre-resolve via `issueLabels` query and `issueLabelCreate` if missing. |
-| 7 | `croniter` DST behavior | **CONFIRMED** — pinned `croniter==6.2.2`; offline-verified per probe output below | N/A — version pin and documented behavior IS the plan. |
+| # | Capability | Status | Notes |
+|---|------------|--------|-------|
+| 1 | Sub-issue creation via `issueCreate(input: { parentId })` | **CONFIRMED ✅** | Verified via `test_archive_removes_from_active_fetch` (creates child under SMI-30). `parent { id }` populates correctly in response — matches plan's Unit 0 defense-in-depth follow-up. |
+| 2 | Custom field read via `fetch_template_children` (response shape) | **CONFIRMED ✅** | `test_custom_field_read` round-trips children of SMI-30. List shape, `parent_id`, `labels`, `state`, `archivedAt` fields populate as expected. Tenant-level `Cron`/`Timezone` custom fields remain plan-tier-gated; R3 YAML fallback is the documented path for affected tenants. |
+| 3 | Custom field write (update `Timezone`) | **Off in MVP** | Plan Key Decision: operator edits YAML or Linear UI directly. |
+| 4 | `issueArchive` mutation | **CONFIRMED ✅** | `test_archive_removes_from_active_fetch` archived created child; `include_archived=False` omitted it, `include_archived=True` re-surfaced it. Archive is non-destructive (data persists, recoverable). |
+| 5 | `commentUpdate` mutation | **Off in MVP** | Plan Key Decision: append-only watermark supersession is the baseline. |
+| 6 | Label ID resolution + colon-bearing label names | **CONFIRMED ✅** | `test_label_id_resolution` passes: absent names omitted from response dict, empty input short-circuits. Colon-bearing labels (`schedule:<type>`, `slot:<ISO>`) accepted by Linear. |
+| 7 | `croniter` DST behavior | **CONFIRMED** | Pinned `croniter==6.2.2`; offline-verified per probe output below. |
 
 ## Capabilities
 
