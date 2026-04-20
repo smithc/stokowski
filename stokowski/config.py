@@ -129,6 +129,11 @@ class LinearStatesConfig:
     schedule_paused: str = "Paused"
     schedule_trigger_now: str = "Trigger Now"
     schedule_error: str = "Error"
+    # Dedicated Canceled state used by the ``cancel_previous`` overlap
+    # policy (R8). Must resolve to a real Linear workflow state; if any
+    # schedule uses ``overlap_policy: cancel_previous`` but this value is
+    # empty, ``validate_config`` rejects the config at load time.
+    canceled: str = "Canceled"
 
 
 # Valid overlap policies for ScheduleConfig.overlap_policy
@@ -464,6 +469,7 @@ def _resolve_linear_state_name(key: str, ls: LinearStatesConfig) -> str:
         "schedule_paused": ls.schedule_paused,
         "schedule_trigger_now": ls.schedule_trigger_now,
         "schedule_error": ls.schedule_error,
+        "canceled": ls.canceled,
     }
     return mapping.get(key, key)
 
@@ -653,6 +659,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         schedule_paused=str(ls_raw.get("schedule_paused", "Paused")),
         schedule_trigger_now=str(ls_raw.get("schedule_trigger_now", "Trigger Now")),
         schedule_error=str(ls_raw.get("schedule_error", "Error")),
+        canceled=str(ls_raw.get("canceled", "Canceled")),
     )
 
     # Parse prompts
@@ -842,6 +849,7 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
     valid_linear_keys = {
         "active", "review", "gate_approved", "rework", "terminal",
         "schedule_scheduled", "schedule_paused", "schedule_trigger_now", "schedule_error",
+        "canceled",
     }
 
     has_agent = False
@@ -970,6 +978,7 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         valid_terminal_keys = {
             "terminal", "todo", "active", "review", "gate_approved", "rework",
             "schedule_scheduled", "schedule_paused", "schedule_trigger_now", "schedule_error",
+            "canceled",
         }
         if wf.terminal_state not in valid_terminal_keys:
             errors.append(
@@ -1063,6 +1072,20 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
                 errors.append(
                     f"linear_states.{field_name} must be set when schedules are defined"
                 )
+
+        # If any schedule uses overlap_policy: cancel_previous, the
+        # dedicated Canceled state must be configured (R8). This is a
+        # runtime-critical invariant — the cancel protocol refuses to fire
+        # without a resolved Canceled state name.
+        any_cancel_previous = any(
+            sc.overlap_policy == "cancel_previous"
+            for sc in cfg.schedules.values()
+        )
+        if any_cancel_previous and not cfg.linear_states.canceled:
+            errors.append(
+                "linear_states.canceled must be set when any schedule uses "
+                "overlap_policy: cancel_previous (R8)"
+            )
 
         for sched_name, sc in cfg.schedules.items():
             # workflow must reference an existing workflow

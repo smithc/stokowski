@@ -291,11 +291,34 @@ class TestCascadeTemplateDelete:
 
         orch._kill_worker = fake_kill
 
+        # Stub _cancel_child_for_overlap to avoid Linear network calls.
+        # Unit 9 routes cascade-delete through the cancel-previous protocol;
+        # we verify it was invoked for each child without exercising the
+        # full mutation sequence here (that's covered in
+        # test_overlap_policies.py).
+        cancel_calls: list[str] = []
+
+        async def fake_cancel(
+            *, child_id, child_identifier, template_id,
+            template_identifier, triggering_slot, canceled_state_name,
+            replacement_child_id=None,
+        ):
+            cancel_calls.append(child_id)
+            # Simulate the protocol's internal cleanup so subsequent
+            # assertions see cleared per-child tracking.
+            await orch._kill_worker(child_id, reason=f"cancel_previous slot={triggering_slot}")
+            orch._cleanup_issue_state(child_id)
+            return True
+
+        orch._cancel_child_for_overlap = fake_cancel
+
         asyncio.run(orch._cascade_template_delete("tmpl-1"))
 
-        # Both children had their workers killed.
+        # Both children routed through the cancel-previous protocol.
+        assert set(cancel_calls) == {"child-a", "child-b"}
+        # Cancel protocol killed each worker.
         assert {c[0] for c in kill_calls} == {"child-a", "child-b"}
-        assert all(c[1] == "template_deleted" for c in kill_calls)
+        assert all(c[1].startswith("cancel_previous") for c in kill_calls)
         # Per-child tracking cleared.
         assert "child-a" not in orch._issue_current_state
         assert "child-b" not in orch._issue_current_state
@@ -315,9 +338,16 @@ class TestCascadeTemplateDelete:
         orch._child_to_template["child-a"] = "tmpl-1"
         orch._child_to_template["child-b"] = "tmpl-1"
 
+        # Force the cancel-previous protocol to raise, exercising the
+        # fallback kill path. The fallback's _kill_worker also raises, to
+        # verify that per-child exceptions don't abort the cascade.
+        async def angry_cancel(**kwargs):
+            raise RuntimeError("cancel blew up")
+
         async def angry_kill(issue_id, reason):
             raise RuntimeError("boom")
 
+        orch._cancel_child_for_overlap = angry_cancel
         orch._kill_worker = angry_kill
 
         # Must not raise — exceptions are caught per-child.

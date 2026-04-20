@@ -17,6 +17,8 @@ MIGRATED_PATTERN = re.compile(r"<!-- stokowski:migrated ({.*?}) -->")
 FIRED_PATTERN = re.compile(r"<!-- stokowski:fired ({.*?}) -->")
 BOUNDED_DROP_PATTERN = re.compile(r"<!-- stokowski:bounded_drop ({.*?}) -->")
 SCHEDULE_ERROR_PATTERN = re.compile(r"<!-- stokowski:schedule_error ({.*?}) -->")
+CANCELED_PATTERN = re.compile(r"<!-- stokowski:canceled ({.*?}) -->")
+CANCELED_REF_PATTERN = re.compile(r"<!-- stokowski:canceled_ref ({.*?}) -->")
 
 # Known watermark status values (for reference; parsers accept anything for
 # forward compat, orchestrator is the canonical consumer).
@@ -613,6 +615,121 @@ def parse_latest_schedule_error(
             data = json.loads(match.group(1))
         except json.JSONDecodeError:
             logger.debug("Skipping malformed stokowski:schedule_error payload")
+            continue
+        if isinstance(data, dict):
+            latest = data
+    return latest
+
+
+# ---------------------------------------------------------------------------
+# Cancel-previous surface (R8)
+# ---------------------------------------------------------------------------
+
+
+def make_cancel_comment(
+    child_id: str,
+    reason: str,
+    triggering_slot: str,
+    template_id: str,
+    *,
+    already_terminaled: bool = False,
+    replacement_child_id: str | None = None,
+    timestamp: str | None = None,
+) -> str:
+    """Build a cancel-previous tracking comment posted on the CHILD issue.
+
+    This is the primary reviewer notification for the
+    ``overlap_policy: cancel_previous`` flow (R8). The child may be
+    actively running, awaiting gate review, or (rarely) already terminal
+    by the time this comment is posted; the ``already_terminaled`` flag
+    preserves the audit signal without overwriting a naturally-terminated
+    child's state.
+    """
+    payload: dict[str, Any] = {
+        "child": child_id,
+        "template": template_id,
+        "reason": reason,
+        "triggering_slot": triggering_slot,
+        "already_terminaled": bool(already_terminaled),
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+    }
+    if replacement_child_id is not None:
+        payload["replacement_child"] = replacement_child_id
+
+    machine = f"<!-- stokowski:canceled {json.dumps(payload)} -->"
+    if already_terminaled:
+        human = (
+            f"**[Stokowski]** Cancel requested for slot `{triggering_slot}` "
+            f"on template **{template_id}** — this child already terminaled "
+            f"naturally; no state change applied."
+        )
+    elif replacement_child_id:
+        human = (
+            f"**[Stokowski]** Canceling this run to make way for fire slot "
+            f"`{triggering_slot}` on template **{template_id}**. "
+            f"Replacement child: **{replacement_child_id}**."
+        )
+    else:
+        human = (
+            f"**[Stokowski]** Canceling this run (reason: `{reason}`) — "
+            f"triggered by slot `{triggering_slot}` on template **{template_id}**."
+        )
+    return f"{machine}\n\n{human}"
+
+
+def make_cancel_reference_comment(
+    template_id: str,
+    canceled_child_identifier: str,
+    triggering_slot: str,
+    *,
+    already_terminaled: bool = False,
+    timestamp: str | None = None,
+) -> str:
+    """Build a short reference comment posted on the TEMPLATE.
+
+    Audit-trail only — the full cancel surface lives on the child (see
+    ``make_cancel_comment``). Kept compact to avoid cluttering the
+    template's comments timeline.
+    """
+    payload: dict[str, Any] = {
+        "template": template_id,
+        "canceled_child": canceled_child_identifier,
+        "triggering_slot": triggering_slot,
+        "already_terminaled": bool(already_terminaled),
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+    }
+    machine = f"<!-- stokowski:canceled_ref {json.dumps(payload)} -->"
+    if already_terminaled:
+        human = (
+            f"**[Stokowski]** Slot `{triggering_slot}` attempted to cancel "
+            f"**{canceled_child_identifier}** — already terminaled naturally."
+        )
+    else:
+        human = (
+            f"**[Stokowski]** Slot `{triggering_slot}` canceled previous "
+            f"child **{canceled_child_identifier}**."
+        )
+    return f"{machine}\n\n{human}"
+
+
+def parse_latest_cancel(comments: list[dict]) -> dict[str, Any] | None:
+    """Return the latest cancel-previous payload posted on a child, or None.
+
+    Oldest-first "last wins" scan. Used by tests (and optionally the
+    dashboard) to verify the cancel protocol posted the expected payload.
+    """
+    latest: dict[str, Any] | None = None
+    for comment in comments:
+        body = comment.get("body", "") if isinstance(comment, dict) else ""
+        if not body:
+            continue
+        match = CANCELED_PATTERN.search(body)
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            logger.debug("Skipping malformed stokowski:canceled payload")
             continue
         if isinstance(data, dict):
             latest = data

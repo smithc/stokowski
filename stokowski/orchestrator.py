@@ -51,6 +51,8 @@ from .runner import run_agent_turn, run_turn
 from .tracking import (
     has_pending_rejection,
     make_bounded_drop_comment,
+    make_cancel_comment,
+    make_cancel_reference_comment,
     make_fired_comment,
     make_gate_comment,
     make_migrated_comment,
@@ -648,10 +650,10 @@ class Orchestrator:
     async def _cascade_template_delete(self, template_id: str) -> None:
         """Template hard-delete detected after N-tick threshold (R21).
 
-        Cancels in-flight children (best-effort via existing
-        ``_kill_worker`` + ``_cleanup_issue_state``; Unit 9 refactors
-        this path into the R8 cancel-previous protocol with a graceful
-        audit-trail transition), destroys persistent workspace (if any),
+        Cancels in-flight children via the R8 cancel-previous protocol
+        (graceful state transition + audit-trail comments on child) when
+        a Canceled state is configured, falling back to the minimal
+        kill-only path otherwise. Destroys persistent workspace (if any)
         and fully cleans up per-template tracking state.
 
         Idempotent: subsequent calls with the same ``template_id`` are
@@ -663,22 +665,53 @@ class Orchestrator:
             f"cascading cleanup after "
             f"{TEMPLATE_HARD_DELETE_THRESHOLD_TICKS} consecutive absences"
         )
-        # Snapshot child ids before mutating tracking — the cancel path
-        # will mutate _template_children / _child_to_template.
+        # Snapshot template identifier + child ids before mutating
+        # tracking — the cancel path will mutate _template_children /
+        # _child_to_template / _template_snapshots.
+        template_snapshot = self._template_snapshots.get(template_id)
+        template_identifier = (
+            template_snapshot.identifier if template_snapshot else template_id
+        )
         children = list(self._template_children.get(template_id, set()))
+        canceled_state_name = (self.cfg.linear_states.canceled or "").strip()
+
         for child_id in children:
-            try:
-                await self._kill_worker(
-                    child_id, reason="template_deleted"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"kill_worker failed for child={child_id} during "
-                    f"cascade delete of template={template_id}: {e}"
-                )
-            # _cleanup_issue_state handles reverse-index + standard
-            # cleanup. Safe regardless of whether the child was running.
-            self._cleanup_issue_state(child_id)
+            child_issue = self._last_issues.get(child_id)
+            child_identifier = (
+                child_issue.identifier if child_issue else child_id
+            )
+            cancel_protocol_ran = False
+            if canceled_state_name:
+                try:
+                    await self._cancel_child_for_overlap(
+                        child_id=child_id,
+                        child_identifier=child_identifier,
+                        template_id=template_id,
+                        template_identifier=template_identifier,
+                        triggering_slot=f"template_deleted:{template_identifier}",
+                        canceled_state_name=canceled_state_name,
+                    )
+                    cancel_protocol_ran = True
+                except Exception as e:
+                    logger.warning(
+                        f"cascade_delete: cancel protocol failed for "
+                        f"child={child_identifier} template={template_identifier}: {e}",
+                        exc_info=True,
+                    )
+            if not cancel_protocol_ran:
+                # Fallback: minimal kill + cleanup. _cancel_child_for_overlap
+                # already does both internally, so only run this branch when
+                # we didn't invoke it (or it raised before them).
+                try:
+                    await self._kill_worker(
+                        child_id, reason="template_deleted"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"kill_worker failed for child={child_identifier} "
+                        f"during cascade delete of template={template_identifier}: {e}"
+                    )
+                self._cleanup_issue_state(child_id)
         # _cleanup_template_state also handles _remove_workspace_for_template
         # internally and wipes all per-template tracking.
         await self._cleanup_template_state(template_id)
@@ -2119,6 +2152,211 @@ class Orchestrator:
                     f"{template.identifier}: {e}"
                 )
 
+    async def _retry_mutation(
+        self,
+        coro_factory,  # callable returning a fresh awaitable each attempt
+        *,
+        retries: int = 3,
+        backoffs: tuple[float, ...] = (0.1, 0.3, 0.9),
+        label: str = "mutation",
+    ) -> bool:
+        """Call ``coro_factory`` up to ``retries`` times with short backoff.
+
+        The factory must return a *fresh* awaitable on each call — an
+        already-awaited coroutine cannot be re-awaited. Returns True on
+        the first success; returns False if all retries exhaust. Transient
+        exceptions are caught and logged at debug; the method never raises.
+
+        Used by the R8 ``cancel_previous`` three-mutation protocol — each
+        of the (state-transition, child-comment, template-reference)
+        mutations gets its own retry loop so a partial failure doesn't
+        silently skip the remaining steps.
+        """
+        for i in range(max(1, retries)):
+            try:
+                result = await coro_factory()
+                if result is False:
+                    # Best-effort signal from Linear client — don't retry
+                    # on a hard-no response (e.g., state-not-found) to
+                    # avoid log spam; caller sees False via return.
+                    logger.debug(
+                        f"_retry_mutation {label!r} attempt {i+1}/{retries}: "
+                        f"factory returned False"
+                    )
+                else:
+                    return True
+            except Exception as e:
+                logger.debug(
+                    f"_retry_mutation {label!r} attempt {i+1}/{retries} "
+                    f"raised: {e}"
+                )
+            if i + 1 < retries:
+                delay = backoffs[i] if i < len(backoffs) else backoffs[-1]
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise
+        return False
+
+    async def _cancel_child_for_overlap(
+        self,
+        child_id: str,
+        child_identifier: str,
+        template_id: str,
+        template_identifier: str,
+        triggering_slot: str,
+        canceled_state_name: str,
+        *,
+        replacement_child_id: str | None = None,
+    ) -> bool:
+        """Three-mutation cancel protocol for R8 ``cancel_previous``.
+
+        Mutations (each independently retried up to 3x):
+          1. Move child to Canceled Linear state, unless it is already at
+             a terminal state — in that case skip the state change but
+             still post the cancel comments with ``already_terminaled`` so
+             the audit trail reflects the race.
+          2. Post the canonical cancel-tracking comment on the CHILD.
+             This is the reviewer's primary notification.
+          3. Post a short reference comment on the TEMPLATE.
+          4. (Best-effort, future) Post a close comment on any linked PR.
+             Deliberately deferred; the plan notes PR-link detection is
+             not gating this unit.
+
+        Returns True only if all attempted mutations succeeded. Partial
+        failures are logged but do NOT block the caller — the new fire is
+        created regardless. The resulting orphan is visible via the
+        dashboard.
+        """
+        if not canceled_state_name:
+            logger.error(
+                f"_cancel_child_for_overlap: canceled_state_name is empty "
+                f"for child={child_identifier} template={template_identifier}; "
+                f"refusing to cancel (config invariant violated)"
+            )
+            return False
+
+        client = self._ensure_linear_client()
+        succeeded = True
+
+        # --- Mutation 1: transition child state (unless already terminal) --
+        already_terminal = self._is_child_already_terminal(child_id)
+        if already_terminal:
+            logger.info(
+                f"cancel_previous: child={child_identifier} already "
+                f"terminal — skipping state transition (preserves audit)"
+            )
+        else:
+            ok = await self._retry_mutation(
+                lambda: client.update_issue_state(
+                    child_id, canceled_state_name
+                ),
+                retries=3,
+                label=f"cancel_state_transition({child_identifier})",
+            )
+            if not ok:
+                logger.warning(
+                    f"cancel_previous: state transition failed for "
+                    f"child={child_identifier} after retries; orphan visible "
+                    f"on dashboard"
+                )
+                succeeded = False
+
+        # --- Mutation 2: cancel comment on child ----------------------------
+        try:
+            child_body = make_cancel_comment(
+                child_id=child_identifier,
+                reason="overlap",
+                triggering_slot=triggering_slot,
+                template_id=template_identifier,
+                already_terminaled=already_terminal,
+                replacement_child_id=replacement_child_id,
+            )
+            ok = await self._retry_mutation(
+                lambda: client.post_comment(child_id, child_body),
+                retries=3,
+                label=f"cancel_child_comment({child_identifier})",
+            )
+            if not ok:
+                logger.warning(
+                    f"cancel_previous: child-comment post failed for "
+                    f"{child_identifier} after retries"
+                )
+                succeeded = False
+        except Exception as e:
+            logger.warning(
+                f"cancel_previous: child-comment build failed "
+                f"child={child_identifier}: {e}"
+            )
+            succeeded = False
+
+        # --- Mutation 3: reference comment on template ----------------------
+        try:
+            ref_body = make_cancel_reference_comment(
+                template_id=template_identifier,
+                canceled_child_identifier=child_identifier,
+                triggering_slot=triggering_slot,
+                already_terminaled=already_terminal,
+            )
+            ok = await self._retry_mutation(
+                lambda: client.post_comment(template_id, ref_body),
+                retries=3,
+                label=f"cancel_template_ref({template_identifier})",
+            )
+            if not ok:
+                logger.warning(
+                    f"cancel_previous: template-reference comment failed for "
+                    f"template={template_identifier} after retries"
+                )
+                succeeded = False
+        except Exception as e:
+            logger.warning(
+                f"cancel_previous: template-ref build failed "
+                f"template={template_identifier}: {e}"
+            )
+            succeeded = False
+
+        # Kill any running worker + clear per-issue tracking so the slot is
+        # freed for the new child. _kill_worker + _cleanup_issue_state are
+        # both idempotent; safe even when the child was only gated.
+        try:
+            await self._kill_worker(
+                child_id, reason=f"cancel_previous slot={triggering_slot}"
+            )
+        except Exception as e:
+            logger.debug(
+                f"cancel_previous: _kill_worker no-op/failed for "
+                f"child={child_identifier}: {e}"
+            )
+        self._cleanup_issue_state(child_id)
+
+        return succeeded
+
+    def _is_child_already_terminal(self, child_id: str) -> bool:
+        """Best-effort check: has the child already terminaled naturally?
+
+        Consults cached state (``self._last_issues`` and
+        ``self._issue_current_state``). Returns False when uncertain —
+        callers treat False as "go ahead and attempt the state
+        transition" which is the safer default for the cancel protocol.
+        """
+        issue = self._last_issues.get(child_id)
+        if issue is not None:
+            state_type = (issue.state_type or "").strip().lower()
+            if state_type in ("completed", "canceled"):
+                return True
+            state_name = (issue.state or "").strip()
+            if state_name and state_name in self.cfg.linear_states.terminal:
+                return True
+        # Fall back to the internal state machine cache — if we've already
+        # cleaned up the issue, odds are it reached a terminal state.
+        if child_id not in self._issue_current_state and child_id not in self.running:
+            # Not conclusive — could also be a brand-new child not yet
+            # tracked. Return False; the worst case is a redundant state
+            # transition attempt that Linear will accept.
+            return False
+        return False
+
     async def _materialize_fire(
         self, template: Issue, decision: "scheduler.FireDecision"  # noqa: F821
     ) -> None:
@@ -2198,6 +2436,71 @@ class Orchestrator:
                 f"(duplicate-sibling recovery)"
             )
             return
+
+        # --- Step 1.5: overlap policy = cancel_previous (R8) ------------
+        # Must run AFTER the duplicate-sibling check (so crash recovery on
+        # the same slot doesn't trigger a redundant cancel) and BEFORE the
+        # pending watermark (so cancel-prep failure doesn't leave a
+        # pending that nobody will resolve).
+        schedule_cfg = self._resolve_schedule_config(template)
+        if (
+            schedule_cfg is not None
+            and schedule_cfg.overlap_policy == "cancel_previous"
+            and active_siblings
+        ):
+            # Refuse-fire-on-config-absence: if the Canceled state name
+            # isn't configured, downgrade this decision to skip_overlap
+            # and move the template to Error. Prevents silent double-fires
+            # when the config invariant is violated.
+            canceled_state_name = (
+                self.cfg.linear_states.canceled or ""
+            ).strip()
+            if not canceled_state_name:
+                logger.error(
+                    f"cancel_previous: canceled state missing in config — "
+                    f"downgrading to skip_overlap for "
+                    f"template={template.identifier} slot={slot}"
+                )
+                await self._post_skip_watermark(
+                    template,
+                    scheduler.FireDecision(
+                        template_id=template.id,
+                        slot=slot,
+                        action="skip_overlap",
+                        reason="cancel_previous_config_missing_canceled_state",
+                    ),
+                )
+                await self._move_template_to_error(
+                    template,
+                    reason="canceled_state_missing",
+                    details=(
+                        "overlap_policy: cancel_previous requires "
+                        "linear_states.canceled but it is not set"
+                    ),
+                )
+                return
+
+            # Cancel each in-flight sibling. Failures are logged but do
+            # NOT block the new fire — per plan, a visible orphan is
+            # preferable to a silent double-child.
+            for sibling in active_siblings:
+                try:
+                    await self._cancel_child_for_overlap(
+                        child_id=sibling.id,
+                        child_identifier=sibling.identifier or sibling.id,
+                        template_id=template.id,
+                        template_identifier=template.identifier,
+                        triggering_slot=slot,
+                        canceled_state_name=canceled_state_name,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"cancel_previous: unexpected exception canceling "
+                        f"sibling={sibling.identifier or sibling.id} for "
+                        f"template={template.identifier} slot={slot}: {e}",
+                        exc_info=True,
+                    )
+                    # Continue — still attempt remaining siblings + new fire.
 
         step = decide_materialize_step(
             decision, active_siblings, attempts_before
