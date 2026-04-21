@@ -110,8 +110,44 @@ def _render_hooks_best_effort(
 
 
 class Orchestrator:
-    def __init__(self, workflow_path: str | Path):
-        self.workflow_path = Path(workflow_path)
+    def __init__(self, workflow_paths):
+        """
+        Accepts either:
+          - A single path (``str`` or ``Path``) — legacy single-project mode.
+          - A sequence of paths — multi-project mode. Order determines the
+            "primary" project (first entry) whose global settings apply.
+
+        The constructor only declares state. ``self.configs`` is populated by
+        ``_load_all_workflows()`` — see ``start()`` and ``_tick()``.
+        """
+        if isinstance(workflow_paths, (str, Path)):
+            self.workflow_paths: list[Path] = [Path(workflow_paths)]
+        else:
+            self.workflow_paths = [Path(p) for p in workflow_paths]
+        if not self.workflow_paths:
+            raise ValueError("Orchestrator requires at least one workflow path")
+
+        # Back-compat: keep ``workflow_path`` pointing at the primary file so
+        # any lingering single-file references keep working during the Unit 5
+        # sweep. Removed at end of Unit 5.
+        self.workflow_path: Path = self.workflow_paths[0]
+
+        # Multi-project state (Unit 2): project_slug -> ParsedConfig.
+        # Insertion order matters — the first loaded file is the "primary"
+        # whose shared globals (max_concurrent_agents, server.port) apply.
+        self.configs: dict[str, ParsedConfig] = {}
+        # Parallel map: project_slug -> source Path (for workflow_dir resolution).
+        self._config_paths: dict[str, Path] = {}
+        self._linear_clients: dict[str, LinearClient] = {}
+
+        # Cached min polling interval across all configs (ms). Set by
+        # _load_all_workflows(). Read by start() poll loop.
+        self._polling_interval_ms: int = 0
+
+        # Transitional back-compat shim — returns the first loaded
+        # ParsedConfig. Unit 5 removes the ``self.cfg`` property that reads
+        # from this. Kept so the existing (mostly single-project) test suite
+        # continues to pass during the refactor.
         self.workflow: ParsedConfig | None = None
 
         # Runtime state
@@ -127,7 +163,7 @@ class Orchestrator:
         self.total_seconds_running: float = 0
 
         # Internal
-        self._linear: LinearClient | None = None
+        self._linear: LinearClient | None = None  # legacy single-client slot (Unit 5 removes)
         self._tasks: dict[str, asyncio.Task] = {}
         self._retry_timers: dict[str, asyncio.TimerHandle] = {}
         self._child_pids: set[int] = set()  # Track claude subprocess PIDs
@@ -143,6 +179,7 @@ class Orchestrator:
         self._pending_gates: dict[str, str] = {}           # issue_id -> gate state name
         self._issue_workflow: dict[str, str] = {}          # issue_id -> workflow name
         self._issue_repo: dict[str, str] = {}              # issue_id -> repo name (multi-repo)
+        self._issue_project: dict[str, str] = {}           # issue_id -> project_slug (multi-project)
 
         # Cancellation tracking
         self._force_cancelled: set[str] = set()  # issue_ids cancelled by reconciliation
@@ -189,35 +226,234 @@ class Orchestrator:
 
     @property
     def cfg(self) -> ServiceConfig:
-        assert self.workflow is not None
+        """Transitional shim: returns the primary (first-loaded) project cfg.
+
+        Kept so the existing (mostly single-project) call sites and tests
+        continue to work during the Unit 5 sweep. Post-dispatch sites should
+        migrate to ``self._cfg_for_issue(issue_id)``; pre-dispatch shared-
+        globals sites should migrate to ``self._primary_cfg()`` explicitly.
+        Removed at the end of Unit 5.
+        """
+        if self.workflow is None and self.configs:
+            self.workflow = next(iter(self.configs.values()))
+        assert self.workflow is not None, "cfg accessed before _load_all_workflows()"
         return self.workflow.config
 
-    def _load_workflow(self) -> list[str]:
-        """Load/reload workflow file. Returns validation errors.
+    def _primary_cfg(self) -> ServiceConfig:
+        """Return the first-loaded project's config (for shared globals).
 
-        On successful reload (no validation errors), clears
-        ``_config_blocked`` — a config-error-blocked issue gets a fresh
-        chance after the operator has updated workflow.yaml.
+        Shared globals (``agent.max_concurrent_agents``, ``server.port``) come
+        from whichever project file loaded first, case-insensitively sorted.
+        ``polling.interval_ms`` is NOT read from here — it's cached on
+        ``self._polling_interval_ms`` as the min across all files.
         """
-        try:
-            self.workflow = parse_workflow_file(self.workflow_path)
-        except Exception as e:
-            return [f"Workflow load error: {e}"]
-        errors = validate_config(self.cfg)
-        if not errors:
-            # Config is healthy — give previously blocked issues a fresh
-            # chance to dispatch. If the hook template is still broken,
-            # _run_worker will re-block them on the next dispatch.
+        if not self.configs:
+            raise RuntimeError("_primary_cfg() called before _load_all_workflows()")
+        return next(iter(self.configs.values())).config
+
+    def _cfg_for_issue(self, issue_id: str) -> ServiceConfig:
+        """Return the ServiceConfig for the project that owns ``issue_id``.
+
+        Issue→project binding is established at fetch time in ``_tick`` /
+        ``_reconcile`` / ``_handle_gate_responses``. If this raises, the
+        caller either forgot to bind the issue first (a bug) or is operating
+        on a stale issue_id whose project mapping was cleaned up.
+        """
+        slug = self._issue_project.get(issue_id)
+        if slug is None:
+            raise RuntimeError(
+                f"No project binding for issue_id={issue_id} — "
+                "caller must stamp _issue_project before calling _cfg_for_issue"
+            )
+        parsed = self.configs.get(slug)
+        if parsed is None:
+            raise RuntimeError(
+                f"issue_id={issue_id} bound to unknown project_slug={slug!r}"
+            )
+        return parsed.config
+
+    def _workflow_dir_for_issue(self, issue_id: str) -> Path:
+        """Parent directory of the project file owning ``issue_id``.
+
+        Used for prompt-file path resolution — project-B prompts must resolve
+        against project-B's directory, not project-A's.
+        """
+        slug = self._issue_project.get(issue_id)
+        if slug is not None and slug in self._config_paths:
+            return self._config_paths[slug].parent
+        return self.workflow_path.parent
+
+    def _linear_client_for(self, project_slug: str) -> LinearClient:
+        """Lazy per-project LinearClient construction."""
+        client = self._linear_clients.get(project_slug)
+        if client is not None:
+            return client
+        parsed = self.configs.get(project_slug)
+        if parsed is None:
+            raise RuntimeError(
+                f"No config loaded for project_slug={project_slug!r}"
+            )
+        client = LinearClient(
+            endpoint=parsed.config.tracker.endpoint,
+            api_key=parsed.config.resolved_api_key(),
+        )
+        self._linear_clients[project_slug] = client
+        return client
+
+    async def _evict_project(self, project_slug: str) -> None:
+        """Drop a project from self.configs and close its LinearClient.
+
+        Called when a previously-loaded project file disappears from disk AND
+        no running/retrying/gated issues remain for that slug. In-flight
+        workers hold their pinned cfg snapshot and are unaffected.
+        """
+        client = self._linear_clients.pop(project_slug, None)
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+        self.configs.pop(project_slug, None)
+
+    def _load_workflow(self) -> list[str]:
+        """Backward-compat wrapper around _load_all_workflows.
+
+        Returns a flat list of error strings (prefixed by file path for
+        non-single-project configs) suitable for existing callers.
+        Unit 3 replaces most call sites with _load_all_workflows directly.
+        """
+        errors_by_slug = self._load_all_workflows()
+        # Map errors-by-project back to a flat list preserving order.
+        flat: list[str] = []
+        for key, errs in errors_by_slug.items():
+            if not errs:
+                continue
+            for e in errs:
+                flat.append(f"{key}: {e}" if key else e)
+        return flat
+
+    def _load_all_workflows(self) -> dict[str, list[str]]:
+        """Load/reload every configured workflow file independently.
+
+        Returns a dict keyed by ``project_slug`` (or by the file path when
+        parse fails before a slug is known) whose values are lists of
+        error strings. Empty list means that project loaded clean.
+
+        Per-file isolation: if one file fails mid-run, its previous cached
+        ParsedConfig stays in self.configs and running agents keep working.
+        First-load failure propagates to caller via the error map.
+        """
+        errors_map: dict[str, list[str]] = {}
+        new_configs: dict[str, ParsedConfig] = {}
+        new_paths: dict[str, Path] = {}
+        # Resolve each configured file path, collecting error entries by slug
+        # when available and by path otherwise.
+        current_path_set: set[Path] = set(self.workflow_paths)
+
+        for path in self.workflow_paths:
+            path_key = str(path)
+            try:
+                parsed = parse_workflow_file(path)
+            except Exception as e:
+                errors_map[path_key] = [f"Workflow load error: {e}"]
+                continue
+
+            slug = parsed.config.tracker.project_slug or path_key
+
+            errs = validate_config(parsed.config)
+
+            # Cross-file duplicate slug check — compare against slugs that
+            # have already loaded THIS tick (not against historical ones).
+            if slug in new_paths:
+                errs.append(
+                    f"duplicate project_slug={slug!r} — also declared in "
+                    f"{new_paths[slug]}"
+                )
+
+            if errs:
+                errors_map[slug] = errs
+                continue
+
+            new_configs[slug] = parsed
+            new_paths[slug] = path
+
+        # Merge policy:
+        #   - For every slug in new_configs → replace in self.configs.
+        #   - For every slug in self.configs whose file is still present in
+        #     self.workflow_paths but failed to parse → keep last-known-good.
+        #   - For every slug in self.configs whose file is no longer in
+        #     self.workflow_paths AND with no in-flight work → evict.
+        has_inflight = (
+            set(self.running.keys())
+            | set(self.retry_attempts.keys())
+            | set(self._pending_gates.keys())
+        )
+        active_slugs = {
+            self._issue_project[iid]
+            for iid in has_inflight
+            if iid in self._issue_project
+        }
+
+        # Replace entries that loaded cleanly this tick.
+        for slug, parsed in new_configs.items():
+            self.configs[slug] = parsed
+            self._config_paths[slug] = new_paths[slug]
+
+        # Evict only slugs whose source file is no longer on disk (not in
+        # self.workflow_paths) AND without in-flight work. This preserves
+        # last-known-good for files present-but-broken.
+        stale_slugs: list[str] = [
+            slug
+            for slug, path in list(self._config_paths.items())
+            if path not in current_path_set and slug not in active_slugs
+        ]
+        for slug in stale_slugs:
+            client = self._linear_clients.pop(slug, None)
+            if client is not None:
+                self._fire_and_forget(client.close())
+            self.configs.pop(slug, None)
+            self._config_paths.pop(slug, None)
+
+        # Update primary reference for the transitional self.cfg shim.
+        if self.configs:
+            self.workflow = next(iter(self.configs.values()))
+
+        # Cache min polling interval across all healthy configs.
+        if self.configs:
+            self._polling_interval_ms = min(
+                parsed.config.polling.interval_ms
+                for parsed in self.configs.values()
+            )
+
+        # Clear _config_blocked on globally healthy load, mirroring legacy
+        # behavior (operator fix resumes all blocked issues).
+        if not errors_map:
             self._config_blocked.clear()
-        return errors
+
+        return errors_map
 
     def _ensure_linear_client(self) -> LinearClient:
-        if self._linear is None:
+        """Legacy single-client accessor.
+
+        Returns the primary project's client. Unit 5 sweep migrates callers
+        to ``_linear_client_for(project_slug)`` with an explicit slug. Kept
+        during Unit 2-4 so existing call sites in the orchestrator keep
+        working before the sweep.
+
+        Test stub support: if ``self._linear`` is set explicitly (as
+        existing tests do), it takes priority — this lets tests continue to
+        stub a single client against the primary project.
+        """
+        if self._linear is not None:
+            return self._linear
+        if not self.configs:
             self._linear = LinearClient(
                 endpoint=self.cfg.tracker.endpoint,
                 api_key=self.cfg.resolved_api_key(),
             )
-        return self._linear
+            return self._linear
+        primary_slug = next(iter(self.configs.keys()))
+        return self._linear_client_for(primary_slug)
 
     # -- Kill / cleanup helpers --
 
@@ -279,6 +515,7 @@ class Orchestrator:
         self._pending_gates.pop(issue_id, None)
         self._issue_workflow.pop(issue_id, None)
         self._issue_repo.pop(issue_id, None)
+        self._issue_project.pop(issue_id, None)
         self._rejected_issues.discard(issue_id)
         self._migrated_issues.discard(issue_id)
         self._config_blocked.discard(issue_id)

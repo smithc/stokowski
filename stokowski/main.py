@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import glob as _glob
 import logging
 import os
 import select
@@ -13,6 +14,7 @@ import termios
 import threading
 import tty
 from pathlib import Path
+from typing import Sequence
 
 
 def _load_dotenv():
@@ -226,8 +228,86 @@ def _make_footer(orch: Orchestrator) -> Text:
     )
 
 
-async def run_orchestrator(workflow_path: str, port: int | None = None):
-    orch = Orchestrator(workflow_path)
+_GLOB_META_CHARS = frozenset("*?[")
+
+
+def resolve_workflow_paths(args: Sequence[str]) -> list[Path]:
+    """Resolve CLI workflow arguments to a sorted, deduplicated list of Paths.
+
+    Semantics (see plan Unit 1):
+    - 0 args: auto-detect ``./workflow.yaml`` / ``./workflow.yml`` / ``./WORKFLOW.md``
+      (legacy one-entry behavior).
+    - 1 arg that is an existing directory: enumerate ``*.yaml`` + ``*.yml`` inside,
+      sort case-insensitively.
+    - 1 arg containing glob metacharacters: expand via ``glob.glob``.
+    - 1 arg that is an existing file: one-entry list (byte-for-byte legacy behavior).
+    - N>=2 args: treat all as explicit list (caller may have shell-expanded already).
+
+    All resolved paths are deduplicated by resolved absolute path and sorted
+    case-insensitively, so the first-loaded ("primary") file is deterministic
+    across platforms with mixed case conventions.
+    """
+    paths: list[Path]
+
+    if len(args) == 0:
+        if Path("workflow.yaml").exists():
+            paths = [Path("./workflow.yaml")]
+        elif Path("workflow.yml").exists():
+            paths = [Path("./workflow.yml")]
+        elif Path("WORKFLOW.md").exists():
+            paths = [Path("./WORKFLOW.md")]
+        else:
+            raise FileNotFoundError(
+                "No workflow file found. Create workflow.yaml / workflow.yml / "
+                "WORKFLOW.md or specify a path explicitly."
+            )
+    elif len(args) == 1:
+        only = args[0]
+        p = Path(only)
+        if p.is_dir():
+            collected = sorted(p.iterdir())
+            paths = [
+                q for q in collected
+                if q.is_file() and q.suffix.lower() in (".yaml", ".yml")
+            ]
+            if not paths:
+                raise FileNotFoundError(
+                    f"Directory {p} contains no .yaml or .yml files"
+                )
+        elif any(ch in only for ch in _GLOB_META_CHARS):
+            matches = _glob.glob(only)
+            if not matches:
+                raise FileNotFoundError(
+                    f"Glob pattern {only!r} matched no files"
+                )
+            paths = [Path(m) for m in matches]
+        elif p.is_file():
+            paths = [p]
+        else:
+            raise FileNotFoundError(f"Workflow path not found: {p}")
+    else:
+        paths = [Path(a) for a in args]
+
+    # Dedup by resolved absolute path; keep first occurrence for deterministic
+    # ordering before the final sort.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for p in paths:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p.absolute())
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+
+    # Case-insensitive sort — ensures platform-stable primary-file selection.
+    unique.sort(key=lambda q: str(q).casefold())
+    return unique
+
+
+async def run_orchestrator(workflow_paths: Sequence[Path] | Path | str, port: int | None = None):
+    orch = Orchestrator(workflow_paths)
     loop = asyncio.get_running_loop()
 
     # Start keyboard handler
@@ -264,9 +344,14 @@ async def run_orchestrator(workflow_path: str, port: int | None = None):
 
     await check_for_updates()
 
+    _paths_display = (
+        str(workflow_paths)
+        if isinstance(workflow_paths, (str, Path))
+        else ", ".join(str(p) for p in workflow_paths)
+    )
     console.print(Panel(
         f"[bold]Stokowski[/bold]  [dim]Claude Code Orchestrator[/dim]\n"
-        f"[dim]workflow:[/dim] {workflow_path}",
+        f"[dim]workflow:[/dim] {_paths_display}",
         border_style="dim",
     ))
 
@@ -306,9 +391,13 @@ def cli():
     )
     parser.add_argument(
         "workflow",
-        nargs="?",
-        default=None,
-        help="Path to workflow.yaml or WORKFLOW.md (auto-detected if not specified)",
+        nargs="*",
+        default=[],
+        help=(
+            "Paths to workflow file(s). Accepts a single file, a directory "
+            "containing workflow files, a glob, or multiple paths. "
+            "Auto-detected if not specified."
+        ),
     )
     parser.add_argument(
         "--port", type=int, default=None,
@@ -325,28 +414,20 @@ def cli():
 
     args = parser.parse_args()
 
-    if args.workflow is None:
-        if Path("workflow.yaml").exists():
-            args.workflow = "./workflow.yaml"
-        elif Path("workflow.yml").exists():
-            args.workflow = "./workflow.yml"
-        elif Path("WORKFLOW.md").exists():
-            args.workflow = "./WORKFLOW.md"
-        else:
-            console.print(
-                "[red]No workflow file found. Create workflow.yaml or WORKFLOW.md, "
-                "or specify a path: stokowski <path>[/red]"
-            )
-            sys.exit(1)
+    try:
+        workflow_paths = resolve_workflow_paths(args.workflow)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
 
     _load_dotenv()
     setup_logging(args.verbose)
 
     if args.dry_run:
-        asyncio.run(dry_run(args.workflow))
+        asyncio.run(dry_run(workflow_paths))
     else:
         try:
-            asyncio.run(run_orchestrator(args.workflow, args.port))
+            asyncio.run(run_orchestrator(workflow_paths, args.port))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted — killing all agents...[/yellow]")
             _force_kill_children()
@@ -391,81 +472,110 @@ def _force_kill_children():
 
 # ── Dry run ───────────────────────────────────────────────────────────────────
 
-async def dry_run(workflow_path: str):
+async def dry_run(workflow_paths: Sequence[Path] | Path | str):
     from .config import parse_workflow_file, validate_config
+    from .linear import LinearClient
+
+    if isinstance(workflow_paths, (str, Path)):
+        paths = [Path(workflow_paths)]
+    else:
+        paths = list(workflow_paths)
 
     console.print("[bold]Dry run mode[/bold]\n")
 
-    try:
-        workflow = parse_workflow_file(workflow_path)
-    except Exception as e:
-        console.print(f"[red]Failed to load workflow: {e}[/red]")
-        sys.exit(1)
+    any_errors = False
+    seen_slugs: dict[str, Path] = {}
 
-    errors = validate_config(workflow.config)
-    if errors:
-        for e in errors:
-            console.print(f"[red]Config error: {e}[/red]")
-        sys.exit(1)
+    for idx, path in enumerate(paths):
+        console.print(f"[bold cyan]── Project file {idx + 1}/{len(paths)}: {path}[/bold cyan]")
+        try:
+            workflow = parse_workflow_file(str(path))
+        except Exception as e:
+            console.print(f"[red]Failed to load workflow: {e}[/red]\n")
+            any_errors = True
+            continue
 
-    cfg = workflow.config
-    console.print("[green]Config valid[/green]")
-    console.print(f"  Tracker: {cfg.tracker.kind}")
-    console.print(f"  Project: {cfg.tracker.project_slug}")
-    console.print(f"  Max agents: {cfg.agent.max_concurrent_agents}")
-    console.print(f"  Claude model: {cfg.claude.model or 'default'}")
-    console.print(f"  Permission mode: {cfg.claude.permission_mode}")
-    console.print(f"  Workspace root: {cfg.workspace.resolved_root()}")
+        errors = validate_config(workflow.config)
+        if errors:
+            for e in errors:
+                console.print(f"[red]  Config error: {e}[/red]")
+            any_errors = True
+            console.print()
+            continue
 
-    if cfg.states:
-        console.print(f"\n  [bold]State machine[/bold] ({len(cfg.states)} states):")
-        console.print(f"    Entry state: {cfg.entry_state}")
-        console.print(f"    Linear states: active={cfg.linear_states.active}, review={cfg.linear_states.review}")
-        for name, state in cfg.states.items():
-            transitions = ", ".join(f"{k}->{v}" for k, v in state.transitions.items())
-            console.print(f"    {name} ({state.type}) -> {transitions or 'terminal'}")
-    else:
-        console.print(f"\n  [dim]Legacy mode (no state machine)[/dim]")
+        cfg = workflow.config
 
-    console.print()
+        # Cross-file duplicate slug check.
+        slug = cfg.tracker.project_slug
+        if slug in seen_slugs:
+            console.print(
+                f"[red]  Duplicate project_slug={slug!r} — also declared in "
+                f"{seen_slugs[slug]}[/red]\n"
+            )
+            any_errors = True
+            continue
+        seen_slugs[slug] = path
 
-    from .linear import LinearClient
+        console.print("[green]  Config valid[/green]")
+        console.print(f"    Tracker: {cfg.tracker.kind}")
+        console.print(f"    Project: {cfg.tracker.project_slug}")
+        console.print(f"    Max agents: {cfg.agent.max_concurrent_agents}")
+        console.print(f"    Claude model: {cfg.claude.model or 'default'}")
+        console.print(f"    Permission mode: {cfg.claude.permission_mode}")
+        console.print(f"    Workspace root: {cfg.workspace.resolved_root()}")
 
-    client = LinearClient(
-        endpoint=cfg.tracker.endpoint,
-        api_key=cfg.resolved_api_key(),
-    )
+        if cfg.states:
+            console.print(f"    [bold]State machine[/bold] ({len(cfg.states)} states):")
+            console.print(f"      Entry state: {cfg.entry_state}")
+            console.print(
+                f"      Linear states: active={cfg.linear_states.active}, "
+                f"review={cfg.linear_states.review}"
+            )
+            for name, state in cfg.states.items():
+                transitions = ", ".join(f"{k}->{v}" for k, v in state.transitions.items())
+                console.print(f"      {name} ({state.type}) -> {transitions or 'terminal'}")
+        else:
+            console.print(f"    [dim]Legacy mode (no state machine)[/dim]")
 
-    try:
-        candidates = await client.fetch_candidate_issues(
-            cfg.tracker.project_slug,
-            cfg.active_linear_states(),
+        client = LinearClient(
+            endpoint=cfg.tracker.endpoint,
+            api_key=cfg.resolved_api_key(),
         )
-    except Exception as e:
-        console.print(f"[red]Failed to fetch candidates: {e}[/red]")
+
+        try:
+            candidates = await client.fetch_candidate_issues(
+                cfg.tracker.project_slug,
+                cfg.active_linear_states(),
+            )
+        except Exception as e:
+            console.print(f"[red]    Failed to fetch candidates: {e}[/red]\n")
+            await client.close()
+            any_errors = True
+            continue
+
+        console.print(f"    [bold]{len(candidates)} candidate issues[/bold]")
+        table = Table()
+        table.add_column("ID", style="cyan")
+        table.add_column("State", style="green")
+        table.add_column("Priority")
+        table.add_column("Title")
+        table.add_column("Labels", style="dim")
+
+        for issue in candidates:
+            table.add_row(
+                issue.identifier,
+                issue.state,
+                str(issue.priority or "—"),
+                issue.title[:60],
+                ", ".join(issue.labels) if issue.labels else "",
+            )
+
+        console.print(table)
         await client.close()
+        console.print()
+
+    if any_errors:
         sys.exit(1)
-
-    console.print(f"[bold]Found {len(candidates)} candidate issues:[/bold]\n")
-
-    table = Table()
-    table.add_column("ID", style="cyan")
-    table.add_column("State", style="green")
-    table.add_column("Priority")
-    table.add_column("Title")
-    table.add_column("Labels", style="dim")
-
-    for issue in candidates:
-        table.add_row(
-            issue.identifier,
-            issue.state,
-            str(issue.priority or "—"),
-            issue.title[:60],
-            ", ".join(issue.labels) if issue.labels else "",
-        )
-
-    console.print(table)
-    await client.close()
 
 
 if __name__ == "__main__":
