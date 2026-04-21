@@ -42,7 +42,14 @@ from .prompt import (
 )
 from jinja2 import UndefinedError
 from .runner import run_agent_turn, run_turn
-from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
+from .tracking import (
+    has_pending_rejection,
+    make_gate_comment,
+    make_migrated_comment,
+    make_rejection_comment,
+    make_state_comment,
+    parse_latest_tracking,
+)
 from .workspace import ensure_workspace, remove_workspace, sanitize_key
 
 logger = logging.getLogger("stokowski")
@@ -135,6 +142,20 @@ class Orchestrator:
         self._force_cancelled: set[str] = set()  # issue_ids cancelled by reconciliation
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
+        # R10 single-repo cap — the async rejection pre-pass populates this
+        # set before the synchronous eligibility loop runs; _is_eligible
+        # only observes membership (no I/O in the hot path). Label-change
+        # invalidation clears entries so dispatch resumes when operators fix
+        # the labels. Orchestrator restart loses the set, but the rejection
+        # pre-pass repopulates it on the first tick by scanning tracking
+        # comments via ``has_pending_rejection``.
+        self._rejected_issues: set[str] = set()
+
+        # Cold-start migration marker — tracks issue IDs for which we have
+        # posted a one-time migrated-comment during this orchestrator run,
+        # so a sequence of gate fetches on the same issue does not spam.
+        self._migrated_issues: set[str] = set()
+
     @property
     def cfg(self) -> ServiceConfig:
         assert self.workflow is not None
@@ -216,6 +237,8 @@ class Orchestrator:
         self._pending_gates.pop(issue_id, None)
         self._issue_workflow.pop(issue_id, None)
         self._issue_repo.pop(issue_id, None)
+        self._rejected_issues.discard(issue_id)
+        self._migrated_issues.discard(issue_id)
         # -- Session/timing --
         self._last_session_ids.pop(issue_id, None)
         self._last_completed_at.pop(issue_id, None)
@@ -467,6 +490,15 @@ class Orchestrator:
         self._issue_repo[issue.id] = repo.name
         return repo
 
+    def _repo_name_for_tracking(self, issue_id: str) -> str:
+        """Return the repo name to carry in a tracking comment payload.
+
+        Thin wrapper over ``_get_issue_repo_config`` that always returns a
+        string (never None). Callers use this when building
+        ``make_state_comment`` / ``make_gate_comment`` payloads.
+        """
+        return self._get_issue_repo_config(issue_id).name
+
     def _get_issue_repo_config(self, issue_id: str) -> "RepoConfig":
         """Look up the cached repo for an issue, with fallbacks.
 
@@ -598,6 +630,13 @@ class Orchestrator:
                 f"No entry state in workflow '{workflow.name}'"
             )
 
+        # --- Cold-start repo recovery ---
+        # If the issue was in-flight before this orchestrator started,
+        # restore its repo assignment from tracking comments. Pre-migration
+        # tracking comments have no `repo` field — post a one-time migrated
+        # notice and fall back to the default-marked repo.
+        await self._resolve_repo_for_coldstart(issue, tracking, comments)
+
         # No tracking → entry state, run 1
         if tracking is None:
             self._issue_current_state[issue.id] = entry
@@ -704,9 +743,10 @@ class Orchestrator:
                 run = self._issue_state_runs.get(issue.id, 1)
 
                 client = self._ensure_linear_client()
+                repo_name = self._repo_name_for_tracking(issue.id)
                 comment = make_gate_comment(
                     state=state_name, status="approved", run=run,
-                    workflow=workflow.name,
+                    workflow=workflow.name, repo=repo_name,
                 )
                 await client.post_comment(issue.id, comment)
 
@@ -720,6 +760,7 @@ class Orchestrator:
                 # Post state-entry comment for audit trail
                 state_comment = make_state_comment(
                     state=target, run=1, workflow=workflow.name,
+                    repo=repo_name,
                 )
                 await client.post_comment(issue.id, state_comment)
 
@@ -741,6 +782,7 @@ class Orchestrator:
             prompt=prompt or "",
             run=run,
             workflow=workflow.name,
+            repo=self._repo_name_for_tracking(issue.id),
         )
         await client.post_comment(issue.id, comment)
 
@@ -888,6 +930,7 @@ class Orchestrator:
                 state=target_name,
                 run=run,
                 workflow=workflow.name,
+                repo=self._repo_name_for_tracking(issue.id),
             )
             await client.post_comment(issue.id, comment)
 
@@ -937,9 +980,10 @@ class Orchestrator:
                     workflow = self._resolve_gate_workflow(issue, tracking)
 
                     run = self._issue_state_runs.get(issue.id, 1)
+                    repo_name = self._repo_name_for_tracking(issue.id)
                     comment = make_gate_comment(
                         state=gate_state, status="approved", run=run,
-                        workflow=workflow.name,
+                        workflow=workflow.name, repo=repo_name,
                     )
                     await client.post_comment(issue.id, comment)
 
@@ -964,6 +1008,7 @@ class Orchestrator:
                     # Post state-entry comment for the approve target
                     state_comment = make_state_comment(
                         state=target, run=1, workflow=workflow.name,
+                        repo=repo_name,
                     )
                     await client.post_comment(issue.id, state_comment)
 
@@ -1023,11 +1068,12 @@ class Orchestrator:
                     # Check max_rework
                     run = self._issue_state_runs.get(issue.id, 1)
                     max_rework = gate_cfg.max_rework if gate_cfg else None
+                    repo_name = self._repo_name_for_tracking(issue.id)
                     if max_rework is not None and run >= max_rework:
                         # Exceeded max rework — post escalated comment, don't transition
                         comment = make_gate_comment(
                             state=gate_state, status="escalated", run=run,
-                            workflow=workflow.name,
+                            workflow=workflow.name, repo=repo_name,
                         )
                         await client.post_comment(issue.id, comment)
                         logger.warning(
@@ -1042,14 +1088,14 @@ class Orchestrator:
                     comment = make_gate_comment(
                         state=gate_state, status="rework",
                         rework_to=rework_to, run=new_run,
-                        workflow=workflow.name,
+                        workflow=workflow.name, repo=repo_name,
                     )
                     await client.post_comment(issue.id, comment)
 
                     # Post state-entry comment for rework target
                     state_comment = make_state_comment(
                         state=rework_to, run=new_run,
-                        workflow=workflow.name,
+                        workflow=workflow.name, repo=repo_name,
                     )
                     await client.post_comment(issue.id, state_comment)
 
@@ -1120,6 +1166,12 @@ class Orchestrator:
                 except Exception as e:
                     logger.warning(f"Failed to resolve state for {issue.identifier}: {e}")
 
+        # Rejection pre-pass: R10 enforcement needs async I/O (Linear comment
+        # fetch for dedup), but _is_eligible is synchronous. This pre-pass
+        # populates _rejected_issues so the sync eligibility check is
+        # I/O-free.
+        await self._process_rejections(candidates)
+
         # Part 5: Dispatch
         available_slots = max(
             self.cfg.agent.max_concurrent_agents - len(self.running), 0
@@ -1147,9 +1199,196 @@ class Orchestrator:
             self._dispatch(issue)
             available_slots -= 1
 
+    async def _resolve_repo_for_coldstart(
+        self,
+        issue: Issue,
+        tracking: dict | None,
+        comments: list[dict],
+    ) -> None:
+        """Restore _issue_repo after a cold start, with migration handling.
+
+        If the cache is already populated for this issue (fresh dispatch in
+        this process), nothing to do.
+
+        If tracking has a ``repo`` field (post-multi-repo tracking comment),
+        use it — but verify the repo still exists in config. A hot-reload
+        could have removed it; fall through to label resolution then.
+
+        If tracking has no ``repo`` field (pre-multi-repo tracking comment,
+        or the very first dispatch in this process), fall back to resolving
+        via labels. If the result is the synthetic ``_default`` repo AND
+        this is the first time we've processed this issue in the current
+        process, post a one-time ``stokowski:migrated`` comment so the
+        cold-start decision is recorded.
+        """
+        if issue.id in self._issue_repo:
+            return
+
+        # Defensive read — payload.get() never direct-subscript
+        tracked_repo_name: str | None = None
+        if tracking is not None:
+            tracked_repo_name = tracking.get("repo")
+
+        if tracked_repo_name is not None:
+            repo = self.cfg.repos.get(tracked_repo_name)
+            if repo is not None:
+                self._issue_repo[issue.id] = repo.name
+                return
+            # Tracked repo no longer in config — fall through to labels.
+            logger.info(
+                f"Cold-start: tracked repo '{tracked_repo_name}' no longer "
+                f"in config for {issue.identifier}; re-resolving from labels"
+            )
+
+        # Resolve from labels
+        try:
+            resolved = self.cfg.resolve_repo(issue)
+        except ValueError:
+            # Shouldn't happen with a validated config — log and bail
+            logger.warning(
+                f"Cold-start: resolve_repo failed for {issue.identifier}; "
+                f"skipping repo cache population"
+            )
+            return
+
+        self._issue_repo[issue.id] = resolved.name
+
+        # Post a migration notice when tracking exists but carried no repo
+        # field. This is the pre-multi-repo tracking shape — a signal that
+        # the ticket was mid-dispatch when the operator deployed v1.
+        if (
+            tracking is not None
+            and tracking.get("repo") is None
+            and issue.id not in self._migrated_issues
+            and resolved.name == "_default"
+        ):
+            try:
+                client = self._ensure_linear_client()
+                await client.post_comment(
+                    issue.id, make_migrated_comment(resolved.name),
+                )
+                self._migrated_issues.add(issue.id)
+            except Exception as e:
+                logger.debug(
+                    f"Failed to post migrated comment for "
+                    f"{issue.identifier}: {e}"
+                )
+
+        # If labels point to an explicit repo but we fell back to _default
+        # (because labels include a `repo:*` that doesn't match anything),
+        # that's an operator-facing situation worth surfacing. The brainstorm
+        # specified this safety check for cold-start scenarios.
+        if (
+            tracking is not None
+            and tracking.get("repo") is None
+            and resolved.name == "_default"
+        ):
+            has_repo_label = any(
+                l.lower().startswith("repo:") for l in (issue.labels or [])
+            )
+            if has_repo_label and issue.id not in self._migrated_issues:
+                logger.warning(
+                    f"Cold-start: {issue.identifier} has repo:* label(s) "
+                    f"but fell back to _default — labels: {issue.labels}"
+                )
+
+    async def _process_rejections(self, issues: list[Issue]) -> None:
+        """Async pre-pass: enforce R10 single-repo cap for each candidate.
+
+        For each issue:
+        1. Count ``repo:*`` labels on ``issue.labels``.
+        2. If > 1 AND the issue was previously rejected with a DIFFERENT
+           label set (labels were edited), discard the prior marker so we
+           can re-evaluate against the new labels on this tick.
+        3. If > 1 AND no marker exists, fetch the comment thread, check
+           for an existing rejection sentinel via ``has_pending_rejection``
+           against the current sorted label set, post a new sentinel iff
+           none exists, then add ``issue.id`` to ``_rejected_issues``.
+        4. If <= 1, ensure ``issue.id`` is NOT in ``_rejected_issues`` —
+           operator fixed the labels, dispatch can proceed.
+
+        Failures to fetch comments are logged but do not populate the set
+        (err on the side of allowing dispatch rather than silently
+        stalling the ticket).
+        """
+        if not issues:
+            return
+
+        client = self._ensure_linear_client()
+
+        for issue in issues:
+            current_labels = [l.lower() for l in (issue.labels or [])]
+            repo_labels = [l for l in current_labels if l.startswith("repo:")]
+
+            # Clear stale markers when labels changed
+            last_issue = self._last_issues.get(issue.id)
+            if (
+                issue.id in self._rejected_issues
+                and last_issue is not None
+                and sorted(l.lower() for l in last_issue.labels) != sorted(current_labels)
+            ):
+                self._rejected_issues.discard(issue.id)
+
+            if len(repo_labels) > 1:
+                if issue.id in self._rejected_issues:
+                    # Already handled on an earlier tick; nothing to do.
+                    continue
+
+                # Check existing comments to avoid duplicate rejection posts
+                try:
+                    comments = await client.fetch_comments(issue.id)
+                except Exception as e:
+                    logger.warning(
+                        f"Rejection pre-pass: failed to fetch comments for "
+                        f"{issue.identifier}: {e}"
+                    )
+                    continue
+
+                if not has_pending_rejection(comments, current_labels):
+                    # Detect triage origin: if the most recent state-tracking
+                    # comment's workflow field is a triage workflow, attribute
+                    # the conflict to triage rather than human labeling.
+                    tracking = parse_latest_tracking(comments)
+                    reason = "multi_repo"
+                    if tracking and tracking.get("type") == "state":
+                        wf_name = tracking.get("workflow")
+                        if wf_name:
+                            wf = self.cfg.get_workflow(wf_name)
+                            if wf and wf.triage:
+                                reason = "triage_multi_repo"
+                    comment_body = make_rejection_comment(
+                        current_labels, reason=reason
+                    )
+                    try:
+                        await client.post_comment(issue.id, comment_body)
+                        logger.info(
+                            f"R10 rejection posted for {issue.identifier} "
+                            f"(labels={repo_labels}, reason={reason})"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to post rejection comment for "
+                            f"{issue.identifier}: {e}"
+                        )
+                        # Do NOT mark as rejected if the post failed —
+                        # next tick will retry.
+                        continue
+
+                self._rejected_issues.add(issue.id)
+            else:
+                # <= 1 repo label: dispatch may proceed. Clear any stale
+                # marker left over from a prior dual-label state.
+                self._rejected_issues.discard(issue.id)
+
     def _is_eligible(self, issue: Issue) -> bool:
         """Check if an issue is eligible for dispatch."""
         if not issue.id or not issue.identifier or not issue.title or not issue.state:
+            return False
+
+        # R10: more than one repo:* label → ineligible. The async pre-pass
+        # (see _process_rejections) has already done the Linear work of
+        # posting a dedup'd rejection comment; we just observe the set here.
+        if issue.id in self._rejected_issues:
             return False
 
         state_lower = issue.state.strip().lower()
@@ -1321,6 +1560,7 @@ class Orchestrator:
                         state=state_name,
                         run=run,
                         workflow=wf.name,
+                        repo=repo.name,
                     )
                     await client.post_comment(issue.id, comment)
 
