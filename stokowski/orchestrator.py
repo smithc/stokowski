@@ -322,11 +322,16 @@ class Orchestrator:
                 self.cfg.terminal_linear_states(),
             )
             ws_root = self.cfg.workspace.resolved_root()
+            # At startup we don't know which repo each terminal issue last ran
+            # against (the _issue_repo cache is empty). Iterate every repo and
+            # try to remove the composite-keyed workspace. remove_workspace is
+            # idempotent — missing workspaces are a silent no-op.
             for issue in terminal:
-                await remove_workspace(
-                    ws_root, issue.identifier, self.cfg.hooks,
-                    docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
-                )
+                for repo in self.cfg.repos.values():
+                    await remove_workspace(
+                        ws_root, issue.identifier, repo.name, self.cfg.hooks,
+                        docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                    )
         except Exception as e:
             logger.warning(f"Startup cleanup failed (continuing): {e}")
 
@@ -764,11 +769,14 @@ class Orchestrator:
                     logger.warning(f"Failed to move {issue.identifier} to terminal state '{terminal_state}'")
             except Exception as e:
                 logger.warning(f"Failed to move {issue.identifier} to terminal: {e}")
-            # Clean up workspace
+            # Clean up workspace — resolve repo first (cache should be
+            # populated from prior dispatch; falls back to default-marked
+            # repo if the cache was cleared or never set).
             try:
                 ws_root = self.cfg.workspace.resolved_root()
+                repo = self._get_issue_repo_config(issue.id)
                 await remove_workspace(
-                    ws_root, issue.identifier, self.cfg.hooks,
+                    ws_root, issue.identifier, repo.name, self.cfg.hooks,
                     docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                 )
             except Exception as e:
@@ -1158,6 +1166,10 @@ class Orchestrator:
                 runner_type = state_cfg.runner
 
             ws_root = self.cfg.workspace.resolved_root()
+            # Resolve repo for this dispatch and cache the name. _resolve_repo
+            # is idempotent: calling it re-evaluates labels each dispatch and
+            # updates _issue_repo accordingly (supports mid-flight label changes).
+            repo = self._resolve_repo(issue)
             docker_image = ""
             if self.cfg.docker.enabled:
                 docker_image = (
@@ -1165,7 +1177,7 @@ class Orchestrator:
                     or self.cfg.docker.default_image
                 )
             ws = await ensure_workspace(
-                ws_root, issue.identifier, self.cfg.hooks,
+                ws_root, issue.identifier, repo.name, self.cfg.hooks,
                 docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                 docker_image=docker_image,
             )
@@ -1670,8 +1682,9 @@ class Orchestrator:
                     cached = self._last_issues.get(issue_id)
                     if cached:
                         ws_root = self.cfg.workspace.resolved_root()
+                        repo = self._get_issue_repo_config(issue_id)
                         await remove_workspace(
-                            ws_root, cached.identifier, self.cfg.hooks,
+                            ws_root, cached.identifier, repo.name, self.cfg.hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                         )
                     self._cleanup_issue_state(issue_id)
@@ -1692,8 +1705,9 @@ class Orchestrator:
                     attempt = self.running.get(issue_id)
                     if attempt:
                         ws_root = self.cfg.workspace.resolved_root()
+                        repo = self._get_issue_repo_config(issue_id)
                         await remove_workspace(
-                            ws_root, attempt.issue_identifier, self.cfg.hooks,
+                            ws_root, attempt.issue_identifier, repo.name, self.cfg.hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                         )
                 else:
@@ -1701,8 +1715,9 @@ class Orchestrator:
                     cached = self._last_issues.get(issue_id)
                     if cached:
                         ws_root = self.cfg.workspace.resolved_root()
+                        repo = self._get_issue_repo_config(issue_id)
                         await remove_workspace(
-                            ws_root, cached.identifier, self.cfg.hooks,
+                            ws_root, cached.identifier, repo.name, self.cfg.hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                         )
 

@@ -20,6 +20,21 @@ def sanitize_key(identifier: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", identifier)
 
 
+def compose_workspace_key(issue_identifier: str, repo_name: str) -> str:
+    """Build a path-safe composite workspace key for an (issue, repo) pair.
+
+    Both components are passed through ``sanitize_key`` so the final key
+    is safe to use as a filesystem subdirectory, a Docker volume name
+    component, etc. The shape is ``{issue}-{repo}``.
+
+    For legacy 1:1 configs, the synthetic ``_default`` repo produces keys
+    like ``SMI-14-_default``. v1 single-repo-per-ticket means this is a
+    one-to-one rename of the prior flat ``{issue}`` layout; v2 multi-repo
+    scope will reuse the same shape without modification.
+    """
+    return f"{sanitize_key(issue_identifier)}-{sanitize_key(repo_name)}"
+
+
 @dataclass
 class WorkspaceResult:
     path: Path
@@ -110,12 +125,18 @@ async def run_hook(
 async def ensure_workspace(
     workspace_root: Path,
     issue_identifier: str,
+    repo_name: str,
     hooks: HooksConfig,
     docker_cfg: DockerConfig | None = None,
     docker_image: str = "",
 ) -> WorkspaceResult:
-    """Create or reuse a workspace for an issue."""
-    key = sanitize_key(issue_identifier)
+    """Create or reuse a workspace for an (issue, repo) pair.
+
+    v1 uses a composite workspace key ``{issue}-{repo}``. Legacy 1:1 configs
+    pass ``repo_name='_default'`` (the synthetic fallback) and get a path
+    like ``{workspace_root}/SMI-14-_default``.
+    """
+    key = compose_workspace_key(issue_identifier, repo_name)
     ws_path = workspace_root / key
 
     if docker_cfg and docker_cfg.enabled:
@@ -172,11 +193,12 @@ async def ensure_workspace(
 async def remove_workspace(
     workspace_root: Path,
     issue_identifier: str,
+    repo_name: str,
     hooks: HooksConfig,
     docker_cfg: DockerConfig | None = None,
 ) -> None:
-    """Remove a workspace directory for a terminal issue."""
-    key = sanitize_key(issue_identifier)
+    """Remove a workspace directory for a terminal (issue, repo) pair."""
+    key = compose_workspace_key(issue_identifier, repo_name)
     ws_path = workspace_root / key
 
     if docker_cfg and docker_cfg.enabled:
