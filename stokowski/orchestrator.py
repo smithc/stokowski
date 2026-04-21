@@ -1622,6 +1622,23 @@ class Orchestrator:
             agent_env["STOKOWSKI_REPO_NAME"] = repo.name
             if repo.clone_url:
                 agent_env["STOKOWSKI_REPO_CLONE_URL"] = repo.clone_url
+            # Triage workflow dispatch: inject the tenant-scoped repo list so
+            # the triage agent can emit repo:<name> labels (R17, R18a).
+            # Non-triage dispatches do not receive the list — agents on
+            # specific repos don't need the full registry.
+            workflow_for_env = self._get_issue_workflow_config(issue.id)
+            if workflow_for_env.triage:
+                import json as _json
+                repo_list = [
+                    {
+                        "name": r.name,
+                        "label": r.label or "",
+                        "clone_url": r.clone_url or "",
+                    }
+                    for r in self.cfg.repos.values()
+                    if r.name != "_default"
+                ]
+                agent_env["STOKOWSKI_REPOS_JSON"] = _json.dumps(repo_list)
 
             # Build log path if logging enabled
             log_path = None
