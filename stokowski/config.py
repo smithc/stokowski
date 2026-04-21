@@ -347,6 +347,25 @@ class ServiceConfig:
                 return wf
         raise ValueError("No default workflow configured")
 
+    def resolve_repo(self, issue: Issue) -> RepoConfig:
+        """Resolve which repo applies to an issue based on its labels.
+
+        Mirrors ``resolve_workflow``: iterate repos, case-insensitive label
+        match (first wins), then fall back to the repo marked ``default=True``.
+
+        For legacy configs (``repos_synthesized=True``) there is exactly one
+        repo (``_default``) marked ``default=True``, so any issue resolves
+        to it.
+        """
+        issue_labels_lower = [l.lower() for l in issue.labels]
+        for repo in self.repos.values():
+            if repo.label is not None and repo.label.lower() in issue_labels_lower:
+                return repo
+        for repo in self.repos.values():
+            if repo.default:
+                return repo
+        raise ValueError("No default repo configured")
+
     def get_workflow(self, name: str) -> WorkflowConfig | None:
         """Look up a workflow by name. Returns None if not found."""
         return self.workflows.get(name)

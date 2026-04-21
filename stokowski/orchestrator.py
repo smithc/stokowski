@@ -16,6 +16,7 @@ from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
 from .config import (
     ClaudeConfig,
     HooksConfig,
+    RepoConfig,
     ServiceConfig,
     StateConfig,
     ParsedConfig,
@@ -74,6 +75,7 @@ class Orchestrator:
         self._issue_state_runs: dict[str, int] = {}       # issue_id -> run number for current state
         self._pending_gates: dict[str, str] = {}           # issue_id -> gate state name
         self._issue_workflow: dict[str, str] = {}          # issue_id -> workflow name
+        self._issue_repo: dict[str, str] = {}              # issue_id -> repo name (multi-repo)
 
         # Cancellation tracking
         self._force_cancelled: set[str] = set()  # issue_ids cancelled by reconciliation
@@ -159,6 +161,7 @@ class Orchestrator:
         self._issue_state_runs.pop(issue_id, None)
         self._pending_gates.pop(issue_id, None)
         self._issue_workflow.pop(issue_id, None)
+        self._issue_repo.pop(issue_id, None)
         # -- Session/timing --
         self._last_session_ids.pop(issue_id, None)
         self._last_completed_at.pop(issue_id, None)
@@ -368,6 +371,49 @@ class Orchestrator:
         if self.cfg.workflows:
             return next(iter(self.cfg.workflows.values()))
         raise RuntimeError("No workflows defined in config")
+
+    def _resolve_repo(self, issue: Issue) -> "RepoConfig":
+        """Resolve which repo applies to an issue and cache the result.
+
+        Mirrors ``_resolve_workflow``. Calls ``self.cfg.resolve_repo(issue)``
+        (label matching + default fallback), then caches the repo name in
+        ``_issue_repo``.
+        """
+        repo = self.cfg.resolve_repo(issue)
+        self._issue_repo[issue.id] = repo.name
+        return repo
+
+    def _get_issue_repo_config(self, issue_id: str) -> "RepoConfig":
+        """Look up the cached repo for an issue, with fallbacks.
+
+        Resolution order, mirroring ``_get_issue_workflow_config``:
+        1. Cached name in ``_issue_repo`` → look up via ``cfg.repos``
+        2. If cached name exists but repo was removed (hot-reload) → re-resolve
+           from the issue's labels (via ``_last_issues`` cache)
+        3. Not cached or resolution failed → return the default-marked repo
+           (in legacy-synthesized mode this naturally resolves to the
+           ``_default`` entry, since Unit 1's synthesis marks it ``default=True``)
+        """
+        cached_name = self._issue_repo.get(issue_id)
+        if cached_name is not None:
+            repo = self.cfg.repos.get(cached_name)
+            if repo is not None:
+                return repo
+            # Repo was removed by hot-reload — try to re-resolve from labels
+            cached_issue = self._last_issues.get(issue_id)
+            if cached_issue is not None:
+                try:
+                    return self._resolve_repo(cached_issue)
+                except ValueError:
+                    pass  # No default — fall through
+        # Not cached or resolution failed — return default-marked repo
+        for repo in self.cfg.repos.values():
+            if repo.default:
+                return repo
+        # Last resort: return first repo (should not happen with valid config)
+        if self.cfg.repos:
+            return next(iter(self.cfg.repos.values()))
+        raise RuntimeError("No repos defined in config")
 
     def _resolve_gate_workflow(
         self, issue: Issue, tracking: dict | None
