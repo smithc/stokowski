@@ -5,7 +5,13 @@ services:
       dockerfile: Dockerfile
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./workflow.yaml:/app/workflow.yaml:ro
+      # Workflow mount — accepts a file OR a directory on the host side.
+      # Single-project: STOKOWSKI_WORKFLOW_HOST_PATH unset → ./workflow.yaml
+      # Multi-project:  set STOKOWSKI_WORKFLOW_HOST_PATH=./workflows/ in .env
+      # The container-side target (/app/workflow) adapts to whichever shape
+      # the host path is; the orchestrator reads STOKOWSKI_WORKFLOW_PATH at
+      # startup (see stokowski/main.py:resolve_workflow_paths).
+      - ${STOKOWSKI_WORKFLOW_HOST_PATH:-./workflow.yaml}:/app/workflow:ro
       - ./prompts:/app/prompts:ro
       - ./logs:/app/logs
       # Read-only view of the host's .claude dir so the orchestrator can read
@@ -19,9 +25,13 @@ services:
       - HOST_HOME=${HOME}
       # Passed through to workflow.yaml; keeps paths in one place.
       - HOST_PLUGIN_SHIM=${HOME}/.stokowski-plugin-shim
+      # Tells the orchestrator where to find workflow config(s) inside the
+      # container. Fixed to the mount target above; operators change the
+      # HOST side via STOKOWSKI_WORKFLOW_HOST_PATH, not this.
+      - STOKOWSKI_WORKFLOW_PATH=/app/workflow
     ports:
       - "${STOKOWSKI_PORT:-4200}:4200"
-    command: ["workflow.yaml", "--port", "4200"]
+    command: ["--port", "4200"]
     restart: unless-stopped
 
 # Per-issue workspace volumes (stokowski-ws-*) are created dynamically
