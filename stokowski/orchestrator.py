@@ -48,6 +48,32 @@ from .workspace import ensure_workspace, remove_workspace, sanitize_key
 logger = logging.getLogger("stokowski")
 
 
+def _resolve_docker_image(
+    state_cfg: StateConfig | None,
+    repo: RepoConfig,
+    platform_default: str,
+) -> str:
+    """3-level Docker image resolution (R8).
+
+    Precedence, most-specific first:
+    1. ``state_cfg.docker_image`` — team workflow stage declaration;
+       wins when the stage is repo-agnostic and the team wants the same
+       image everywhere.
+    2. ``repo.docker_image`` — repo registry entry default; used for
+       toolchain-bound stages on heterogeneous teams.
+    3. ``platform_default`` — the configured ``docker.default_image``
+       fallback.
+
+    Returns an empty string when no image is configured at any level;
+    the caller decides whether that's acceptable.
+    """
+    if state_cfg and state_cfg.docker_image:
+        return state_cfg.docker_image
+    if repo.docker_image:
+        return repo.docker_image
+    return platform_default or ""
+
+
 def _render_hooks_best_effort(
     hooks: HooksConfig,
     repo: RepoConfig,
@@ -277,11 +303,20 @@ class Orchestrator:
             ok, msg = await check_docker_available()
             if not ok:
                 raise RuntimeError(f"Docker mode enabled but: {msg}")
-            # Pre-pull all configured images
-            images = {self.cfg.docker.default_image}
+            # Pre-pull all configured images across the 3-level hybrid:
+            # platform default + every state-level override + every
+            # repo-level default. Missing an image here would force a cold
+            # pull during the agent's first dispatch (no timeout wrapper),
+            # so the union must stay in sync with resolve_docker_image.
+            images: set[str] = set()
+            if self.cfg.docker.default_image:
+                images.add(self.cfg.docker.default_image)
             for sc in self.cfg.states.values():
                 if sc.docker_image:
                     images.add(sc.docker_image)
+            for repo in self.cfg.repos.values():
+                if repo.docker_image:
+                    images.add(repo.docker_image)
             for img in images:
                 logger.info(f"Pulling Docker image: {img}")
                 if not await pull_image(img):
@@ -1219,9 +1254,8 @@ class Orchestrator:
             repo = self._resolve_repo(issue)
             docker_image = ""
             if self.cfg.docker.enabled:
-                docker_image = (
-                    (state_cfg.docker_image if state_cfg else None)
-                    or self.cfg.docker.default_image
+                docker_image = _resolve_docker_image(
+                    state_cfg, repo, self.cfg.docker.default_image,
                 )
             # Render root hooks with repo metadata when the config has an
             # explicit repos: section. Legacy configs (repos_synthesized)
