@@ -48,6 +48,7 @@ from .prompt import (
     render_hooks_for_dispatch,
 )
 from .runner import run_agent_turn, run_turn
+from .session_store import SessionStore
 from .tracking import (
     has_pending_rejection,
     make_gate_comment,
@@ -168,6 +169,10 @@ class Orchestrator:
         self._retry_timers: dict[str, asyncio.TimerHandle] = {}
         self._child_pids: set[int] = set()  # Track claude subprocess PIDs
         self._last_session_ids: dict[str, str] = {}  # issue_id -> last known session_id
+        # Disk persistence for session ids across restarts. Initialized in
+        # ``start()`` once configs are loaded. None when persistence is
+        # disabled or not yet initialized — callers must null-check.
+        self._session_store: SessionStore | None = None
         self._jinja = Environment(undefined=StrictUndefined)
         self._running = False
         self._last_issues: dict[str, Issue] = {}
@@ -282,6 +287,81 @@ class Orchestrator:
         if slug is not None and slug in self._config_paths:
             return self._config_paths[slug].parent
         return self.workflow_path.parent
+
+    def _init_session_store(self) -> None:
+        """Construct the SessionStore and bootstrap ``_last_session_ids``.
+
+        Called from ``start()`` after configs are loaded. Uses the primary
+        project's ``session_persistence`` config to decide path and enabled
+        state. Disabled config leaves ``self._session_store = None`` and
+        ``_last_session_ids`` empty — matching pre-feature behavior.
+
+        All I/O failures are caught and logged: session persistence is
+        best-effort and must never prevent startup.
+        """
+        try:
+            primary = self._primary_cfg()
+        except RuntimeError:
+            return  # No configs loaded — nothing to persist.
+
+        sp_cfg = primary.session_persistence
+        if not sp_cfg.enabled:
+            return
+
+        try:
+            primary_slug = next(iter(self.configs.keys()))
+            workflow_dir: Path | None = None
+            if primary_slug in self._config_paths:
+                workflow_dir = self._config_paths[primary_slug].parent
+            resolved = sp_cfg.resolved_path(
+                workspace_root=primary.workspace.resolved_root(),
+                workflow_dir=workflow_dir,
+            )
+            store = SessionStore(resolved)
+            loaded = store.load()
+            self._session_store = store
+            self._last_session_ids.update(loaded)
+            logger.info(
+                f"Session persistence enabled path={resolved} "
+                f"loaded={len(loaded)} session(s)"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to initialize session store (continuing without "
+                f"persistence): {e!r}"
+            )
+            self._session_store = None
+
+    def _build_session_id_callback(
+        self,
+        issue_id: str,
+        state_cfg: StateConfig | None,
+    ):
+        """Build a runner ``on_session_id`` callback that mid-turn persists.
+
+        Fires when Claude Code's event stream first emits a ``session_id`` —
+        including the early ``system``/``init`` event — so a kill before the
+        ``result`` event still leaves a resumable id on disk. Honors the
+        ``session: fresh`` suppression: fresh-mode states never persist,
+        matching the behavior at ``_on_worker_exit``.
+
+        Returns ``None`` when the store is disabled OR the state is fresh —
+        no callback fire = no wasted work in the runner.
+        """
+        if self._session_store is None:
+            return None
+        if state_cfg is not None and state_cfg.session == "fresh":
+            return None
+
+        def _cb(session_id: str) -> None:
+            self._last_session_ids[issue_id] = session_id
+            try:
+                self._session_store.set(issue_id, session_id)
+            except Exception as e:
+                logger.warning(
+                    f"Mid-turn session persist failed for issue={issue_id}: {e!r}"
+                )
+        return _cb
 
     def _linear_client_for(self, project_slug: str) -> LinearClient:
         """Lazy per-project LinearClient construction."""
@@ -523,6 +603,13 @@ class Orchestrator:
         self._prev_issue_labels.pop(issue_id, None)
         # -- Session/timing --
         self._last_session_ids.pop(issue_id, None)
+        if self._session_store is not None:
+            try:
+                self._session_store.evict(issue_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to evict session id for {issue_id}: {e!r}"
+                )
         self._last_completed_at.pop(issue_id, None)
         # -- Issue cache --
         self._last_issues.pop(issue_id, None)
@@ -660,6 +747,10 @@ class Orchestrator:
         self._running = True
         self._stop_event = asyncio.Event()
 
+        # Initialize session-id persistence BEFORE startup cleanup. Terminal
+        # issues are evicted during cleanup, so the store must exist by then.
+        self._init_session_store()
+
         # Startup terminal cleanup
         await self._startup_cleanup()
 
@@ -765,6 +856,16 @@ class Orchestrator:
                             ws_root, issue.identifier, repo.name, rendered_hooks,
                             docker_cfg=pcfg.docker if pcfg.docker.enabled else None,
                         )
+                    # Evict any persisted session id for terminal issues so
+                    # the store does not accumulate entries across restarts.
+                    if self._session_store is not None:
+                        try:
+                            self._session_store.evict(issue.id)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to evict session id for "
+                                f"{issue.identifier}: {e!r}"
+                            )
             except Exception as e:
                 logger.warning(f"Startup cleanup failed for {slug} (continuing): {e}")
 
@@ -2158,6 +2259,9 @@ class Orchestrator:
             # transitions and cause the agent to blow past stage
             # boundaries.
             if state_name and state_cfg:
+                on_session_id_cb = self._build_session_id_callback(
+                    issue.id, state_cfg,
+                )
                 attempt = await run_turn(
                     runner_type=runner_type,
                     claude_cfg=claude_cfg,
@@ -2173,6 +2277,7 @@ class Orchestrator:
                     workspace_key=ws.workspace_key,
                     docker_image=docker_image,
                     log_path=log_path,
+                    on_session_id=on_session_id_cb,
                 )
             else:
                 # Legacy mode: multi-turn loop
@@ -2213,6 +2318,9 @@ class Orchestrator:
                         ext = ".log" if runner_type == "codex" else ".ndjson"
                         turn_log_path = issue_log_dir / f"{timestamp}-turn-{attempt.turn_count + 1}{ext}"
 
+                    on_session_id_cb = self._build_session_id_callback(
+                        issue.id, state_cfg,
+                    )
                     attempt = await run_turn(
                         runner_type=runner_type,
                         claude_cfg=claude_cfg,
@@ -2228,6 +2336,7 @@ class Orchestrator:
                         workspace_key=ws.workspace_key,
                         docker_image=docker_image,
                         log_path=turn_log_path,
+                        on_session_id=on_session_id_cb,
                     )
 
                     if attempt.status != "succeeded":
@@ -2412,6 +2521,14 @@ class Orchestrator:
                 should_persist = False
             if should_persist:
                 self._last_session_ids[issue.id] = attempt.session_id
+                if self._session_store is not None:
+                    try:
+                        self._session_store.set(issue.id, attempt.session_id)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to persist session id for "
+                            f"{issue.identifier}: {e!r}"
+                        )
 
         completed_at = datetime.now(timezone.utc)
         attempt.completed_at = completed_at

@@ -590,6 +590,10 @@ agent:
 prompts:
   global_prompt: prompts/global.md     # loaded for every agent turn (optional)
 
+session_persistence:                   # Claude Code session ids across restarts
+  enabled: true                        # default: true — set false to opt out
+  path: ""                             # default: {workspace.root}/.stokowski-sessions.json
+
 states:                                # the state machine pipeline
   investigate:
     type: agent

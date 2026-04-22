@@ -230,3 +230,124 @@ class TestLoggingConfig:
         cfg = LoggingConfig(log_dir="$TEST_LOG_DIR/sub")
         resolved = cfg.resolved_log_dir()
         assert str(resolved) == "/tmp/test-logs/sub"
+
+
+# ---------------------------------------------------------------------------
+# SessionPersistenceConfig parsing and path resolution
+# ---------------------------------------------------------------------------
+
+
+class TestSessionPersistenceConfig:
+    def test_default_values(self):
+        from stokowski.config import SessionPersistenceConfig
+
+        cfg = SessionPersistenceConfig()
+        assert cfg.enabled is True
+        assert cfg.path == ""
+
+    def test_resolved_path_default_uses_workspace_root(self, tmp_path):
+        from stokowski.config import SessionPersistenceConfig
+
+        cfg = SessionPersistenceConfig()
+        resolved = cfg.resolved_path(workspace_root=tmp_path)
+        assert resolved == tmp_path / ".stokowski-sessions.json"
+
+    def test_resolved_path_expands_tilde(self, tmp_path):
+        from stokowski.config import SessionPersistenceConfig
+
+        cfg = SessionPersistenceConfig(path="~/sessions.json")
+        resolved = cfg.resolved_path(workspace_root=tmp_path)
+        assert "~" not in str(resolved)
+        assert str(resolved).endswith("sessions.json")
+
+    def test_resolved_path_expands_env_var(self, monkeypatch, tmp_path):
+        from stokowski.config import SessionPersistenceConfig
+
+        monkeypatch.setenv("SESSIONS_DIR", "/tmp/sessions-dir")
+        cfg = SessionPersistenceConfig(path="$SESSIONS_DIR/store.json")
+        resolved = cfg.resolved_path(workspace_root=tmp_path)
+        assert str(resolved) == "/tmp/sessions-dir/store.json"
+
+    def test_resolved_path_relative_to_workflow_dir(self, tmp_path):
+        from stokowski.config import SessionPersistenceConfig
+
+        cfg = SessionPersistenceConfig(path="./sessions.json")
+        workflow_dir = tmp_path / "workflows"
+        resolved = cfg.resolved_path(
+            workspace_root=tmp_path / "ws",
+            workflow_dir=workflow_dir,
+        )
+        assert resolved == workflow_dir / "sessions.json"
+
+    def test_resolved_path_absolute_ignores_workflow_dir(self, tmp_path):
+        from stokowski.config import SessionPersistenceConfig
+
+        cfg = SessionPersistenceConfig(path="/abs/sessions.json")
+        resolved = cfg.resolved_path(
+            workspace_root=tmp_path,
+            workflow_dir=tmp_path / "ignored",
+        )
+        assert str(resolved) == "/abs/sessions.json"
+
+    def test_parse_from_yaml(self, tmp_path):
+        from stokowski.config import parse_workflow_file
+
+        yaml_content = """
+tracker:
+  kind: linear
+  project_slug: test
+  api_key: k
+workspace:
+  root: /tmp/ws
+linear_states:
+  active: "In Progress"
+session_persistence:
+  enabled: false
+  path: "/custom/sessions.json"
+states:
+  work:
+    type: agent
+    prompt: dummy
+    linear_state: active
+  done:
+    type: terminal
+    linear_state: terminal
+"""
+        cfg_path = tmp_path / "workflow.yaml"
+        cfg_path.write_text(yaml_content)
+        prompt_file = tmp_path / "dummy"
+        prompt_file.write_text("x")
+
+        parsed = parse_workflow_file(cfg_path)
+        assert parsed.config.session_persistence.enabled is False
+        assert parsed.config.session_persistence.path == "/custom/sessions.json"
+
+    def test_parse_defaults_when_omitted(self, tmp_path):
+        from stokowski.config import parse_workflow_file
+
+        yaml_content = """
+tracker:
+  kind: linear
+  project_slug: test
+  api_key: k
+workspace:
+  root: /tmp/ws
+linear_states:
+  active: "In Progress"
+states:
+  work:
+    type: agent
+    prompt: dummy
+    linear_state: active
+  done:
+    type: terminal
+    linear_state: terminal
+"""
+        cfg_path = tmp_path / "workflow.yaml"
+        cfg_path.write_text(yaml_content)
+        prompt_file = tmp_path / "dummy"
+        prompt_file.write_text("x")
+
+        parsed = parse_workflow_file(cfg_path)
+        assert parsed.config.session_persistence.enabled is True
+        assert parsed.config.session_persistence.path == ""

@@ -116,6 +116,40 @@ class LoggingConfig:
 
 
 @dataclass
+class SessionPersistenceConfig:
+    """Claude Code session-id persistence across orchestrator restarts.
+
+    When enabled, the orchestrator writes `_last_session_ids` to a JSON file on
+    every save-point mutation and reloads it on startup. This allows inherit-mode
+    states to resume their prior Claude session after a restart instead of
+    starting fresh. Fresh-mode states (`session: fresh`) never touch this file.
+    """
+    enabled: bool = True
+    path: str = ""
+
+    def resolved_path(
+        self,
+        workspace_root: Path,
+        workflow_dir: Path | None = None,
+    ) -> Path:
+        """Resolve ~ and $VAR in path, with a sensible default.
+
+        Args:
+            workspace_root: Primary project's resolved workspace root. Used as
+                the default location when ``path`` is empty.
+            workflow_dir: Base directory for resolving relative paths (e.g.
+                the directory of the primary workflow file).
+        """
+        if not self.path:
+            return workspace_root / ".stokowski-sessions.json"
+        expanded = os.path.expanduser(os.path.expandvars(self.path))
+        p = Path(expanded)
+        if not p.is_absolute() and workflow_dir:
+            p = workflow_dir / p
+        return p
+
+
+@dataclass
 class LinearStatesConfig:
     """Maps logical state names to actual Linear state names."""
     todo: str = "Todo"
@@ -252,6 +286,9 @@ class ServiceConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    session_persistence: SessionPersistenceConfig = field(
+        default_factory=SessionPersistenceConfig
+    )
     linear_states: LinearStatesConfig = field(default_factory=LinearStatesConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
@@ -588,6 +625,13 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         max_total_size_mb=_coerce_int(lg.get("max_total_size_mb"), 500),
     )
 
+    # Parse session_persistence
+    sp = config_raw.get("session_persistence", {}) or {}
+    session_persistence = SessionPersistenceConfig(
+        enabled=bool(sp.get("enabled", True)),
+        path=str(sp.get("path", "")),
+    )
+
     # Parse linear_states
     ls_raw = config_raw.get("linear_states", {}) or {}
     linear_states = LinearStatesConfig(
@@ -729,6 +773,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         agent=agent,
         server=server,
         logging=logging_cfg,
+        session_persistence=session_persistence,
         linear_states=linear_states,
         prompts=prompts,
         docker=docker,

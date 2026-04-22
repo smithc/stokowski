@@ -126,6 +126,21 @@ server:
   port: 4200
 
 # ---------------------------------------------------------------------------
+# Session-id persistence (enabled by default)
+#
+# Persists Claude Code session ids to disk so inherit-mode states resume
+# their prior conversation after an orchestrator restart. `session: fresh`
+# states are never persisted (see CLAUDE.md → Session-id persistence).
+#
+# The default path is `{workspace.root}/.stokowski-sessions.json`, which is
+# writable in both bare-CLI and docker-compose deployments. Override `path`
+# to relocate the file; set `enabled: false` to opt out entirely.
+# ---------------------------------------------------------------------------
+# session_persistence:
+#   enabled: true
+#   path: ""   # empty → default location under workspace.root
+
+# ---------------------------------------------------------------------------
 # Docker isolation (optional — agents run as sibling containers)
 # ---------------------------------------------------------------------------
 # docker:

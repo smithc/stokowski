@@ -23,6 +23,10 @@ TRANSITION_PATTERN = re.compile(r"<!--\s*transition:(\w[\w-]*)\s*-->")
 EventCallback = Callable[[str, str, dict[str, Any]], None]
 # Callback for registering/unregistering child PIDs
 PidCallback = Callable[[int, bool], None]  # (pid, is_register)
+# Callback fired when a new session_id is observed on the event stream.
+# Enables mid-turn persistence so a kill between init and result still
+# leaves a resumable session id on disk.
+SessionIdCallback = Callable[[str], None]
 
 
 def _prepare_docker_args(
@@ -349,8 +353,15 @@ async def run_agent_turn(
     workspace_key: str = "",
     docker_image: str = "",
     log_path: Path | None = None,
+    on_session_id: SessionIdCallback | None = None,
 ) -> RunAttempt:
-    """Run a single Claude Code turn. Returns updated RunAttempt."""
+    """Run a single Claude Code turn. Returns updated RunAttempt.
+
+    ``on_session_id`` is invoked whenever a new Claude session_id is
+    observed on the event stream, which includes the early ``system``/
+    ``init`` event — enabling the orchestrator to persist the id mid-turn
+    so a kill between init and result still leaves a resumable session.
+    """
     args = build_claude_args(
         claude_cfg, prompt, workspace_path, attempt.session_id,
         issue_identifier=issue.identifier,
@@ -446,7 +457,10 @@ async def run_agent_turn(
             except json.JSONDecodeError:
                 continue
 
-            _process_event(event, attempt, on_event, issue.identifier)
+            _process_event(
+                event, attempt, on_event, issue.identifier,
+                on_session_id=on_session_id,
+            )
 
     async def stall_monitor():
         while proc.returncode is None:
@@ -550,15 +564,36 @@ def _process_event(
     attempt: RunAttempt,
     on_event: EventCallback | None,
     identifier: str,
+    on_session_id: SessionIdCallback | None = None,
 ):
-    """Process a single NDJSON event from Claude Code stream-json output."""
+    """Process a single NDJSON event from Claude Code stream-json output.
+
+    ``on_session_id`` is fired whenever a new session_id is observed — both
+    from the early ``system``/``init`` event and from the final ``result``
+    event. Mid-turn capture via the early event is what lets a kill-before-
+    result still leave a resumable session id on disk. The callback is
+    invoked only when the id actually changes, so it's safe to fire on every
+    event that carries one.
+    """
     event_type = event.get("type", "")
     attempt.last_event = event_type
 
-    # Extract session_id from result events
+    # Session id may appear in the early `system`/`init` event, in every
+    # `result` event, and occasionally in intermediate events. Capture from
+    # any event that carries it; fire the callback on change only.
+    incoming_sid = event.get("session_id")
+    if isinstance(incoming_sid, str) and incoming_sid and incoming_sid != attempt.session_id:
+        attempt.session_id = incoming_sid
+        if on_session_id is not None:
+            try:
+                on_session_id(incoming_sid)
+            except Exception as e:
+                logger.warning(
+                    f"on_session_id callback raised for {identifier}: {e!r}"
+                )
+
+    # Result-specific extraction (session_id itself is captured above).
     if event_type == "result":
-        if "session_id" in event:
-            attempt.session_id = event["session_id"]
         # Extract token usage
         usage = event.get("usage", {})
         if usage:
@@ -619,6 +654,7 @@ async def run_turn(
     workspace_key: str = "",
     docker_image: str = "",
     log_path: Path | None = None,
+    on_session_id: SessionIdCallback | None = None,
 ) -> RunAttempt:
     """Route to the correct runner based on runner_type."""
     if runner_type == "codex":
@@ -653,6 +689,7 @@ async def run_turn(
             workspace_key=workspace_key,
             docker_image=docker_image,
             log_path=log_path,
+            on_session_id=on_session_id,
         )
     else:
         raise ValueError(f"Unknown runner type: {runner_type}")
